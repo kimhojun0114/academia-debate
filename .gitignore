@@ -1,0 +1,14 @@
+# 비밀값·데이터 — 절대 커밋 금지
+api_profiles.json
+league.db
+.env
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
