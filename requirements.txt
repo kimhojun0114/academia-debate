@@ -1,7 +1,8 @@
 flask
 flask-socketio
-eventlet
 gunicorn
+gevent
+gevent-websocket
 anthropic
 openai
 google-genai
