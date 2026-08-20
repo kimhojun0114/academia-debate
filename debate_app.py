@@ -24,6 +24,7 @@ sid_to_user = {}
 TOTAL_TURNS = 5
 ADMIN_CODE = os.environ.get("DEBATE_ADMIN_CODE", "1234")
 PROFILE_FILE = "api_profiles.json"
+SECRET_PROFILE_FILE = "/etc/secrets/api_profiles.json"
 
 ALIAS_POOL = ["너구리", "고래", "부엉이", "수달", "펭귄", "사막여우", "돌고래",
               "호랑이", "판다", "카피바라", "문어", "매", "고슴도치", "알파카",
@@ -39,16 +40,16 @@ DEFAULT_PROFILES = {
 }
 
 def load_profiles():
-    if not os.path.exists(PROFILE_FILE):
-        with open(PROFILE_FILE, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_PROFILES, f, ensure_ascii=False, indent=2)
-        return dict(DEFAULT_PROFILES)
-    try:
-        with open(PROFILE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"[프로필 파일 오류] {e}")
-        return dict(DEFAULT_PROFILES)
+    for path in (SECRET_PROFILE_FILE, PROFILE_FILE):
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"[프로필 파일 오류] {path}: {e}")
+    with open(PROFILE_FILE, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_PROFILES, f, ensure_ascii=False, indent=2)
+    return dict(DEFAULT_PROFILES)
 
 def save_profiles(data):
     with open(PROFILE_FILE, "w", encoding="utf-8") as f:
