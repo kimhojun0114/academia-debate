@@ -12,3 +12,5 @@ services:
         generateValue: true
       - key: DEBATE_ADMIN_CODE
         sync: false
+      - key: DATABASE_URL
+        sync: false

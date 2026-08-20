@@ -1,16 +1,20 @@
 import os
 import json
 import random
-import sqlite3
 import uuid
 import hashlib
+import psycopg2
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit, join_room
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'debate_secret_key_1234'
+app.config['SECRET_KEY'] = os.environ.get('DEBATE_SECRET_KEY', 'debate_secret_key_1234')
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL 환경변수가 설정되지 않았습니다. Supabase 연결 문자열을 등록해주세요.")
 
 waiting_pool = []
 rooms = {}
@@ -95,18 +99,23 @@ def llm_call(prompt, max_tokens=600):
         print(f"[LLM 호출 실패] {provider}: {e}")
         return None
 
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
 def db_execute(query, params=()):
-    conn = sqlite3.connect('league.db')
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(query, params)
     conn.commit()
+    cursor.close()
     conn.close()
 
 def db_fetchall(query, params=()):
-    conn = sqlite3.connect('league.db')
+    conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(query, params)
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
     return rows
 
@@ -118,35 +127,31 @@ def init_db():
     db_execute('''CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY, pin_hash TEXT,
         wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, points INTEGER DEFAULT 1000)''')
-    try:
-        db_execute("ALTER TABLE users ADD COLUMN pin_hash TEXT")
-    except Exception:
-        pass
     db_execute('''CREATE TABLE IF NOT EXISTS debates (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, played_at TEXT, topic TEXT,
+        id SERIAL PRIMARY KEY, played_at TEXT, topic TEXT,
         player_a TEXT, player_b TEXT, log_json TEXT, winner TEXT, reason TEXT, engine TEXT)''')
 
 def hash_pin(username, pin):
     return hashlib.sha256(f"{username}:{pin}:academia".encode()).hexdigest()
 
 def get_user_stats(username):
-    row = db_fetchone("SELECT wins, losses, points FROM users WHERE username = ?", (username,))
+    row = db_fetchone("SELECT wins, losses, points FROM users WHERE username = %s", (username,))
     if not row:
         return None
-    rank_row = db_fetchone("SELECT COUNT(*) FROM users WHERE points > ?", (row[2],))
+    rank_row = db_fetchone("SELECT COUNT(*) FROM users WHERE points > %s", (row[2],))
     return {"wins": row[0], "losses": row[1], "points": row[2], "rank": rank_row[0] + 1}
 
 def add_points(username, n):
-    db_execute("UPDATE users SET points = points + ? WHERE username = ?", (n, username))
+    db_execute("UPDATE users SET points = points + %s WHERE username = %s", (n, username))
 
 def record_win_loss(winner, loser):
-    db_execute("UPDATE users SET wins = wins + 1, points = points + 20 WHERE username = ?", (winner,))
-    db_execute("UPDATE users SET losses = losses + 1, points = points - 15 WHERE username = ?", (loser,))
+    db_execute("UPDATE users SET wins = wins + 1, points = points + 20 WHERE username = %s", (winner,))
+    db_execute("UPDATE users SET losses = losses + 1, points = points - 15 WHERE username = %s", (loser,))
 
 def save_debate(topic, player_a, player_b, logs, winner, reason):
     engine = profile_data.get("active", "테스트 모드")
     db_execute(
-        "INSERT INTO debates (played_at, topic, player_a, player_b, log_json, winner, reason, engine) VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO debates (played_at, topic, player_a, player_b, log_json, winner, reason, engine) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
         (datetime.now().strftime("%Y-%m-%d %H:%M"), topic, player_a, player_b,
          json.dumps(logs, ensure_ascii=False), winner, reason, engine))
 
@@ -361,9 +366,9 @@ def admin():
                 message = "❌ 존재하지 않는 프로필입니다."
         elif action == 'resetpin':
             target = (request.form.get('reset_user') or '').strip()
-            row = db_fetchone("SELECT username FROM users WHERE username = ?", (target,))
+            row = db_fetchone("SELECT username FROM users WHERE username = %s", (target,))
             if row:
-                db_execute("UPDATE users SET pin_hash = ? WHERE username = ?", (hash_pin(target, "0000"), target))
+                db_execute("UPDATE users SET pin_hash = %s WHERE username = %s", (hash_pin(target, "0000"), target))
                 message = f"✅ '{target}'의 PIN이 0000으로 초기화되었습니다."
             else:
                 message = f"❌ '{target}' 아이디를 찾을 수 없습니다."
@@ -411,13 +416,13 @@ def handle_login(data):
     if username in sid_to_user.values():
         emit('error_msg', {'msg': '이 아이디는 이미 다른 기기에서 접속 중입니다.'})
         return
-    row = db_fetchone("SELECT pin_hash FROM users WHERE username = ?", (username,))
+    row = db_fetchone("SELECT pin_hash FROM users WHERE username = %s", (username,))
     is_new = False
     if not row:
-        db_execute("INSERT INTO users (username, pin_hash) VALUES (?, ?)", (username, hash_pin(username, pin)))
+        db_execute("INSERT INTO users (username, pin_hash) VALUES (%s, %s)", (username, hash_pin(username, pin)))
         is_new = True
     elif row[0] is None:
-        db_execute("UPDATE users SET pin_hash = ? WHERE username = ?", (hash_pin(username, pin), username))
+        db_execute("UPDATE users SET pin_hash = %s WHERE username = %s", (hash_pin(username, pin), username))
     elif row[0] != hash_pin(username, pin):
         emit('error_msg', {'msg': 'PIN이 틀렸습니다.'})
         return

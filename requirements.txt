@@ -3,6 +3,7 @@ flask-socketio
 gunicorn
 gevent
 gevent-websocket
+psycopg2-binary
 anthropic
 openai
 google-genai
