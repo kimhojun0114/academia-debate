@@ -182,8 +182,9 @@ def save_debate(topic, player_a, player_b, side_a, side_b, logs, winner, reason)
 init_db()
 
 def get_ai_topic():
-    recent_rows = db_fetchall("SELECT DISTINCT topic FROM debates ORDER BY id DESC LIMIT 15")
-    recent_list = "\n".join(f"- {r[0]}" for r in recent_rows) if recent_rows else "(없음)"
+    recent_rows = db_fetchall("SELECT topic FROM debates ORDER BY id DESC LIMIT 30")
+    recent_topics = list(dict.fromkeys(r[0] for r in recent_rows))[:15]
+    recent_list = "\n".join(f"- {t}" for t in recent_topics) if recent_topics else "(없음)"
     prompt = f"""고등학생 토론 동아리의 1대1 즉흥 찬반 토론에 쓸 주제를 하나 추천해줘.
 
 조건:
