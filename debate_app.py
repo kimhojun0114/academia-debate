@@ -33,9 +33,16 @@ DEFAULT_GEMINI_KEY = "AQ.Ab8RN6LuDcj_jU7-uZHXTq8uQELxQPoh6mrDkzldT3RfG5pPYA"
 
 PROVIDERS = ["gemini", "openai", "anthropic"]
 DEFAULT_MODELS = {
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.7-flash",
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
+}
+
+# 지원 종료된 모델들. Google이 "모델 없음" 대신 401 인증 오류를 반환해
+# 키 문제처럼 보이게 만들기 때문에, 서버 시작 시 자동으로 최신 모델로 교체한다.
+DEPRECATED_MODELS = {
+    "gemini": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash",
+               "gemini-2.5-pro", "gemini-1.5-pro"],
 }
 
 ALIAS_POOL = [
@@ -145,6 +152,19 @@ def seed_default_profile():
         db_execute("UPDATE ai_profiles SET api_key = %s WHERE name = %s", (seed_key, "Gemini"))
     if not get_setting("active_profile"):
         set_setting("active_profile", "Gemini")
+    migrate_deprecated_models()
+
+
+def migrate_deprecated_models():
+    """지원 종료된 모델을 쓰는 프로필을 최신 기본 모델로 자동 교체."""
+    for provider, old_models in DEPRECATED_MODELS.items():
+        new_model = DEFAULT_MODELS[provider]
+        for old in old_models:
+            rows = db_fetchall("SELECT name FROM ai_profiles WHERE provider = %s AND model = %s",
+                               (provider, old))
+            for (name,) in rows:
+                db_execute("UPDATE ai_profiles SET model = %s WHERE name = %s", (new_model, name))
+                print(f"[모델 자동 교체] {name}: {old} → {new_model}")
 
 def get_active_profile():
     """활성 프로필 반환. 테스트 모드거나 키가 없으면 None."""
