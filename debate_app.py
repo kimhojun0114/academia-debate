@@ -28,6 +28,9 @@ TURN_SECONDS = 300
 ADMIN_CODE = os.environ.get("DEBATE_ADMIN_CODE", "1234")
 TEST_MODE = "테스트 모드"
 
+# 기본 Gemini 키 (환경변수 GEMINI_API_KEY가 있으면 그쪽이 우선)
+DEFAULT_GEMINI_KEY = "AQ.Ab8RN6LuDcj_jU7-uZHXTq8uQELxQPoh6mrDkzldT3RfG5pPYA"
+
 PROVIDERS = ["gemini", "openai", "anthropic"]
 DEFAULT_MODELS = {
     "gemini": "gemini-2.5-flash",
@@ -131,17 +134,17 @@ def get_active_name():
     return get_setting("active_profile", TEST_MODE) or TEST_MODE
 
 def seed_default_profile():
-    """최초 1회: Gemini 프로필 한 개만 생성. 키는 환경변수 GEMINI_API_KEY에서 읽음."""
-    if get_setting("seeded") == "1":
-        return
-    if not db_fetchone("SELECT name FROM ai_profiles WHERE name = %s", ("Gemini",)):
-        upsert_profile("Gemini", "gemini", DEFAULT_MODELS["gemini"],
-                       os.environ.get("GEMINI_API_KEY", ""))
-    if os.environ.get("GEMINI_API_KEY"):
+    """Gemini 프로필 한 개를 보장. 키가 비어 있으면 기본 키로 채움.
+    환경변수 GEMINI_API_KEY가 있으면 그 값을 우선 사용."""
+    seed_key = os.environ.get("GEMINI_API_KEY", "").strip() or DEFAULT_GEMINI_KEY
+    row = db_fetchone("SELECT api_key FROM ai_profiles WHERE name = %s", ("Gemini",))
+    if not row:
+        upsert_profile("Gemini", "gemini", DEFAULT_MODELS["gemini"], seed_key)
+    elif not (row[0] or "").strip():
+        # 프로필은 있는데 키가 비어 있으면 채워줌 (관리자가 넣은 키는 건드리지 않음)
+        db_execute("UPDATE ai_profiles SET api_key = %s WHERE name = %s", (seed_key, "Gemini"))
+    if not get_setting("active_profile"):
         set_setting("active_profile", "Gemini")
-    elif not get_setting("active_profile"):
-        set_setting("active_profile", TEST_MODE)
-    set_setting("seeded", "1")
 
 def get_active_profile():
     """활성 프로필 반환. 테스트 모드거나 키가 없으면 None."""
@@ -330,6 +333,12 @@ body{-webkit-user-select:none;user-select:none;} input,textarea{user-select:auto
 .side-tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:0.85em;font-weight:bold;}
 .side-pro{background:#dcfce7;color:#166534;} .side-con{background:#fee2e2;color:#991b1b;}
 .stage-label{color:#7c3aed;font-weight:bold;}
+input,textarea{font-size:16px;background:#fff;color:#111827;-webkit-appearance:none;appearance:none;
+  border:1px solid #d1d5db;border-radius:6px;font-family:inherit;}
+button{-webkit-appearance:none;appearance:none;border:1px solid #93c5fd;border-radius:6px;
+  background:#2563eb;color:#ffffff !important;-webkit-text-fill-color:#ffffff;
+  cursor:pointer;font-size:15px;font-weight:bold;font-family:inherit;}
+button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
 </style>
 </head>
 <body>
@@ -447,9 +456,20 @@ td{border-bottom:1px solid #f3f4f6;padding:4px;}
 .room-btn{display:block;width:100%;text-align:left;padding:8px;margin-bottom:6px;cursor:pointer;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;}
 #watch-chat{height:300px;overflow-y:auto;border:1px solid #e5e7eb;padding:10px;background:#f9fafb;border-radius:8px;margin-top:10px;font-size:0.9em;}
 .hidden{display:none;}
-input[type=text],input[type=password],select{padding:6px;border:1px solid #d1d5db;border-radius:6px;}
-button{border:1px solid #d1d5db;border-radius:6px;background:#f9fafb;cursor:pointer;}
-button:hover{background:#eef2ff;}
+input[type=text],input[type=password]{padding:8px;border:1px solid #d1d5db;border-radius:6px;
+  font-size:16px;background:#fff;color:#111827;-webkit-appearance:none;appearance:none;
+  max-width:100%;box-sizing:border-box;}
+select{padding:8px 28px 8px 8px;border:1px solid #d1d5db;border-radius:6px;
+  font-size:16px;background:#fff;color:#111827;max-width:100%;
+  -webkit-appearance:none;appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8'><path d='M1 1l5 5 5-5' stroke='%23374151' stroke-width='2' fill='none'/></svg>");
+  background-repeat:no-repeat;background-position:right 9px center;}
+button,input[type=submit]{-webkit-appearance:none;appearance:none;
+  border:1px solid #93c5fd;border-radius:6px;background:#2563eb;color:#ffffff !important;
+  cursor:pointer;font-size:15px;font-weight:bold;padding:10px 16px;margin:4px 4px 4px 0;
+  font-family:inherit;-webkit-text-fill-color:#ffffff;}
+button:hover{background:#1d4ed8;}
+button:active{background:#1e40af;}
 .hint{font-size:0.82em;color:#6b7280;}
 fieldset{border:1px solid #e5e7eb;border-radius:8px;margin-bottom:12px;padding:12px;}
 legend{font-weight:bold;font-size:0.92em;color:#374151;padding:0 6px;}
