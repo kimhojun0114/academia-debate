@@ -26,8 +26,14 @@ TOTAL_STAGES = len(STAGES)
 TURN_SECONDS = 300
 
 ADMIN_CODE = os.environ.get("DEBATE_ADMIN_CODE", "1234")
-PROFILE_FILE = "api_profiles.json"
-SECRET_PROFILE_FILE = "/etc/secrets/api_profiles.json"
+TEST_MODE = "테스트 모드"
+
+PROVIDERS = ["gemini", "openai", "anthropic"]
+DEFAULT_MODELS = {
+    "gemini": "gemini-2.5-flash",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-haiku-4-5",
+}
 
 ALIAS_POOL = [
     "대한민국의 첫 번째 왕좌를 차지한 자", "왕좌를 놓지 않는 건국의 노인",
@@ -49,44 +55,117 @@ ALIAS_POOL = [
     "형수의 목소리를 남긴 찢어진 별",
 ]
 
-DEFAULT_PROFILES = {
-    "active": "테스트 모드",
-    "profiles": [
-        {"name": "김호준 Claude", "provider": "anthropic", "model": "claude-haiku-4-5",  "api_key": "여기에_키_입력"},
-        {"name": "김호준 GPT",    "provider": "openai",    "model": "gpt-4o-mini",       "api_key": "여기에_키_입력"},
-        {"name": "서하준 Gemini", "provider": "gemini",    "model": "gemini-2.5-flash",  "api_key": "여기에_키_입력"}
-    ]
-}
 
-def load_profiles():
-    for path in (SECRET_PROFILE_FILE, PROFILE_FILE):
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"[프로필 파일 오류] {path}: {e}")
-    with open(PROFILE_FILE, "w", encoding="utf-8") as f:
-        json.dump(DEFAULT_PROFILES, f, ensure_ascii=False, indent=2)
-    return dict(DEFAULT_PROFILES)
+# ─────────────────────────────────────────────
+# DB 기본 유틸
+# ─────────────────────────────────────────────
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-def save_profiles(data):
-    with open(PROFILE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def db_execute(query, params=()):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-profile_data = load_profiles()
+def db_fetchall(query, params=()):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return rows
+
+def db_fetchone(query, params=()):
+    rows = db_fetchall(query, params)
+    return rows[0] if rows else None
+
+
+def init_db():
+    db_execute('''CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY, pin_hash TEXT,
+        wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, points INTEGER DEFAULT 1000)''')
+    db_execute('''CREATE TABLE IF NOT EXISTS debates (
+        id SERIAL PRIMARY KEY, played_at TEXT, topic TEXT,
+        player_a TEXT, player_b TEXT, side_a TEXT, side_b TEXT,
+        log_json TEXT, winner TEXT, reason TEXT, engine TEXT)''')
+    db_execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS side_a TEXT")
+    db_execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS side_b TEXT")
+    # AI 프로필과 설정을 DB에 저장 → Render 재배포에도 유지됨
+    db_execute('''CREATE TABLE IF NOT EXISTS ai_profiles (
+        name TEXT PRIMARY KEY, provider TEXT, model TEXT, api_key TEXT)''')
+    db_execute('''CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY, value TEXT)''')
+
+
+# ─────────────────────────────────────────────
+# 설정 / AI 프로필 (DB 기반)
+# ─────────────────────────────────────────────
+def get_setting(key, default=None):
+    row = db_fetchone("SELECT value FROM app_settings WHERE key = %s", (key,))
+    return row[0] if row else default
+
+def set_setting(key, value):
+    db_execute("INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+               "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
+
+def list_profiles():
+    rows = db_fetchall("SELECT name, provider, model, api_key FROM ai_profiles ORDER BY name")
+    return [{"name": r[0], "provider": r[1], "model": r[2], "api_key": r[3] or ""} for r in rows]
+
+def upsert_profile(name, provider, model, api_key):
+    db_execute("INSERT INTO ai_profiles (name, provider, model, api_key) VALUES (%s,%s,%s,%s) "
+               "ON CONFLICT (name) DO UPDATE SET provider = EXCLUDED.provider, "
+               "model = EXCLUDED.model, api_key = EXCLUDED.api_key",
+               (name, provider, model, api_key))
+
+def delete_profile(name):
+    db_execute("DELETE FROM ai_profiles WHERE name = %s", (name,))
+    if get_active_name() == name:
+        set_setting("active_profile", TEST_MODE)
+
+def get_active_name():
+    return get_setting("active_profile", TEST_MODE) or TEST_MODE
+
+def seed_default_profile():
+    """최초 1회: Gemini 프로필 한 개만 생성. 키는 환경변수 GEMINI_API_KEY에서 읽음."""
+    if get_setting("seeded") == "1":
+        return
+    if not db_fetchone("SELECT name FROM ai_profiles WHERE name = %s", ("Gemini",)):
+        upsert_profile("Gemini", "gemini", DEFAULT_MODELS["gemini"],
+                       os.environ.get("GEMINI_API_KEY", ""))
+    if os.environ.get("GEMINI_API_KEY"):
+        set_setting("active_profile", "Gemini")
+    elif not get_setting("active_profile"):
+        set_setting("active_profile", TEST_MODE)
+    set_setting("seeded", "1")
 
 def get_active_profile():
-    active = profile_data.get("active", "테스트 모드")
-    if active == "테스트 모드":
+    """활성 프로필 반환. 테스트 모드거나 키가 없으면 None."""
+    active = get_active_name()
+    if active == TEST_MODE:
         return None
-    for p in profile_data.get("profiles", []):
-        if p["name"] == active:
-            if not p.get("api_key") or "여기에" in p["api_key"]:
-                return None
-            return p
-    return None
+    row = db_fetchone("SELECT name, provider, model, api_key FROM ai_profiles WHERE name = %s", (active,))
+    if not row:
+        return None
+    name, provider, model, api_key = row
+    if not api_key or not api_key.strip():
+        return None
+    return {"name": name, "provider": provider, "model": model, "api_key": api_key.strip()}
 
+def mask_key(key):
+    if not key:
+        return ""
+    key = key.strip()
+    return ("*" * max(0, len(key) - 4)) + key[-4:] if len(key) > 4 else "****"
+
+
+# ─────────────────────────────────────────────
+# LLM 호출
+# ─────────────────────────────────────────────
 def llm_call(prompt, max_tokens=600):
     profile = get_active_profile()
     if not profile:
@@ -119,41 +198,24 @@ def llm_call(prompt, max_tokens=600):
         print(f"[LLM 호출 실패] {provider}: {e}")
         return None
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-def db_execute(query, params=()):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    conn.commit()
-    cursor.close()
-    conn.close()
+def test_llm_connection():
+    """관리자 페이지의 '연결 테스트' 버튼용."""
+    profile = get_active_profile()
+    if not profile:
+        return False, "활성 프로필이 없거나 API 키가 비어 있습니다."
+    try:
+        result = llm_call("'연결 성공'이라고만 답해.", max_tokens=50)
+        if result:
+            return True, f"응답: {result[:60]}"
+        return False, "응답이 비어 있습니다. 서버 로그의 [LLM 호출 실패] 메시지를 확인하세요."
+    except Exception as e:
+        return False, str(e)[:200]
 
-def db_fetchall(query, params=()):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return rows
 
-def db_fetchone(query, params=()):
-    rows = db_fetchall(query, params)
-    return rows[0] if rows else None
-
-def init_db():
-    db_execute('''CREATE TABLE IF NOT EXISTS users (
-        username TEXT PRIMARY KEY, pin_hash TEXT,
-        wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, points INTEGER DEFAULT 1000)''')
-    db_execute('''CREATE TABLE IF NOT EXISTS debates (
-        id SERIAL PRIMARY KEY, played_at TEXT, topic TEXT,
-        player_a TEXT, player_b TEXT, side_a TEXT, side_b TEXT,
-        log_json TEXT, winner TEXT, reason TEXT, engine TEXT)''')
-    db_execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS side_a TEXT")
-    db_execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS side_b TEXT")
-
+# ─────────────────────────────────────────────
+# 사용자 / 토론 기록
+# ─────────────────────────────────────────────
 def hash_pin(username, pin):
     return hashlib.sha256(f"{username}:{pin}:academia".encode()).hexdigest()
 
@@ -172,15 +234,21 @@ def record_win_loss(winner, loser):
     db_execute("UPDATE users SET losses = losses + 1, points = points - 15 WHERE username = %s", (loser,))
 
 def save_debate(topic, player_a, player_b, side_a, side_b, logs, winner, reason):
-    engine = profile_data.get("active", "테스트 모드")
+    engine = get_active_name()
     db_execute(
         "INSERT INTO debates (played_at, topic, player_a, player_b, side_a, side_b, log_json, winner, reason, engine) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (datetime.now().strftime("%Y-%m-%d %H:%M"), topic, player_a, player_b, side_a, side_b,
          json.dumps(logs, ensure_ascii=False), winner, reason, engine))
 
-init_db()
 
+init_db()
+seed_default_profile()
+
+
+# ─────────────────────────────────────────────
+# AI 기능
+# ─────────────────────────────────────────────
 def get_ai_topic():
     recent_rows = db_fetchall("SELECT topic FROM debates ORDER BY id DESC LIMIT 30")
     recent_topics = list(dict.fromkeys(r[0] for r in recent_rows))[:15]
@@ -237,6 +305,7 @@ def judge_debate(topic, logs):
         return winner, result_text
     except Exception:
         return "무승부", f"판정 오류\nAI 원문: {raw[:200]}"
+
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="ko">
@@ -377,25 +446,64 @@ th{text-align:left;border-bottom:1px solid #e5e7eb;padding:4px;}
 td{border-bottom:1px solid #f3f4f6;padding:4px;}
 .room-btn{display:block;width:100%;text-align:left;padding:8px;margin-bottom:6px;cursor:pointer;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;}
 #watch-chat{height:300px;overflow-y:auto;border:1px solid #e5e7eb;padding:10px;background:#f9fafb;border-radius:8px;margin-top:10px;font-size:0.9em;}
+.hidden{display:none;}
+input[type=text],input[type=password],select{padding:6px;border:1px solid #d1d5db;border-radius:6px;}
+button{border:1px solid #d1d5db;border-radius:6px;background:#f9fafb;cursor:pointer;}
+button:hover{background:#eef2ff;}
+.hint{font-size:0.82em;color:#6b7280;}
+fieldset{border:1px solid #e5e7eb;border-radius:8px;margin-bottom:12px;padding:12px;}
+legend{font-weight:bold;font-size:0.92em;color:#374151;padding:0 6px;}
 </style>
 </head><body><h2>🛠️ 운영자 설정</h2>
 {% if message %}<p class="msg">{{ message }}</p>{% endif %}
-<div class="box"><h3>AI 엔진 선택</h3><p>현재: <b>{{ active }}</b></p>
-<p style="font-size:0.85em;color:#666;">키 등록은 api_profiles.json 파일 수정 후 "파일 다시 읽기"</p>
+
+<div class="box"><h3>🤖 AI 엔진</h3>
+<p>현재 활성: <b>{{ active }}</b></p>
+
 <form method="POST" action="/admin">
 {% for p in profiles %}
 <div class="profile {% if p.name == active %}active{% endif %}">
 <label><input type="radio" name="profile" value="{{ p.name }}" {% if p.name == active %}checked{% endif %}>
-<b>{{ p.name }}</b> — {{ p.provider }}/{{ p.model }}
-{% if p.key_ok %}<span class="ok">(키 등록됨 ✓)</span>{% else %}<span class="bad">(키 미등록)</span>{% endif %}
-</label></div>{% endfor %}
+<b>{{ p.name }}</b> — {{ p.provider }} / {{ p.model }}
+{% if p.key_ok %}<span class="ok">(키 등록됨 ✓ {{ p.masked }})</span>{% else %}<span class="bad">(키 미등록)</span>{% endif %}
+</label></div>
+{% endfor %}
 <div class="profile {% if active == '테스트 모드' %}active{% endif %}">
 <label><input type="radio" name="profile" value="테스트 모드" {% if active == '테스트 모드' %}checked{% endif %}>
 <b>테스트 모드</b> — AI 없이 동작</label></div>
 <p>운영자 코드: <input type="password" name="code" placeholder="코드 입력"></p>
 <button type="submit" name="action" value="switch" style="padding:8px 15px;">엔진 변경</button>
-<button type="submit" name="action" value="reload" style="padding:8px 15px;">파일 다시 읽기</button>
-</form></div>
+<button type="submit" name="action" value="test" style="padding:8px 15px;">🔌 연결 테스트</button>
+</form>
+</div>
+
+<div class="box"><h3>🔑 AI 툴 등록 / 변경</h3>
+<p class="hint">이름과 API 키를 등록하면 바로 사용할 수 있습니다. 같은 이름으로 다시 등록하면 덮어쓰기(키 변경)가 됩니다.<br>
+키는 데이터베이스에 저장되므로 재배포해도 유지됩니다.</p>
+
+<form method="POST" action="/admin">
+<fieldset><legend>등록 / 수정</legend>
+<p>이름 <input type="text" name="p_name" placeholder="예: Gemini" style="width:150px;">
+&nbsp;제공사
+<select name="p_provider">
+  {% for pv in providers %}<option value="{{ pv }}">{{ pv }}</option>{% endfor %}
+</select></p>
+<p>모델 <input type="text" name="p_model" placeholder="비우면 기본 모델 사용" style="width:220px;"></p>
+<p>API 키 <input type="text" name="p_key" placeholder="키 입력 (비우면 기존 키 유지)" style="width:340px;"></p>
+<label class="hint"><input type="checkbox" name="p_activate" value="1" checked> 등록 후 바로 이 툴을 활성화</label>
+</fieldset>
+
+<fieldset><legend>삭제</legend>
+<p>이름 <input type="text" name="del_name" placeholder="삭제할 툴 이름" style="width:150px;"></p>
+</fieldset>
+
+<p>운영자 코드: <input type="password" name="code" placeholder="코드 입력"></p>
+<button type="submit" name="action" value="save_profile" style="padding:8px 15px;">저장</button>
+<button type="submit" name="action" value="delete_profile" style="padding:8px 15px;" onclick="return confirm('정말 삭제하시겠습니까?')">삭제</button>
+</form>
+
+<p class="hint">기본 모델 — gemini: {{ default_models['gemini'] }} / openai: {{ default_models['openai'] }} / anthropic: {{ default_models['anthropic'] }}</p>
+</div>
 
 <div class="box"><h3>👤 아이디 생성 및 관리</h3>
 <table>
@@ -484,31 +592,73 @@ HISTORY_TEMPLATE = """<!DOCTYPE html>
 </details></div>{% else %}<p>아직 토론 기록이 없습니다.</p>{% endfor %}
 <p><a href="/">← 토론 화면</a></p></body></html>"""
 
+
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, engine_name=profile_data.get("active", "테스트 모드"), turn_seconds=TURN_SECONDS)
+    return render_template_string(HTML_TEMPLATE, engine_name=get_active_name(), turn_seconds=TURN_SECONDS)
+
 
 @app.route('/admin', methods=['GET', 'POST'])
 def admin():
-    global profile_data
     message = None
     if request.method == 'POST':
         code = request.form.get('code', '')
         action = request.form.get('action', '')
         if code != ADMIN_CODE:
             message = "❌ 운영자 코드가 틀렸습니다."
-        elif action == 'reload':
-            profile_data = load_profiles()
-            message = "🔄 파일을 다시 읽었습니다."
+
+        # ── AI 엔진 전환 / 테스트 ──
         elif action == 'switch':
-            chosen = request.form.get('profile', '테스트 모드')
-            valid_names = [p['name'] for p in profile_data.get('profiles', [])] + ['테스트 모드']
+            chosen = request.form.get('profile', TEST_MODE)
+            valid_names = [p['name'] for p in list_profiles()] + [TEST_MODE]
             if chosen in valid_names:
-                profile_data['active'] = chosen
-                save_profiles(profile_data)
+                set_setting("active_profile", chosen)
                 message = f"✅ '{chosen}'으로 변경되었습니다."
             else:
                 message = "❌ 존재하지 않는 프로필입니다."
+        elif action == 'test':
+            ok, detail = test_llm_connection()
+            message = ("✅ 연결 성공! " if ok else "❌ 연결 실패: ") + detail
+
+        # ── AI 툴 등록 / 수정 / 삭제 ──
+        elif action == 'save_profile':
+            name = (request.form.get('p_name') or '').strip()
+            provider = (request.form.get('p_provider') or 'gemini').strip()
+            model = (request.form.get('p_model') or '').strip()
+            key = (request.form.get('p_key') or '').strip()
+            activate = request.form.get('p_activate') == '1'
+            if not name:
+                message = "❌ 툴 이름을 입력해주세요."
+            elif name == TEST_MODE:
+                message = f"❌ '{TEST_MODE}'는 예약된 이름입니다."
+            elif provider not in PROVIDERS:
+                message = "❌ 지원하지 않는 제공사입니다."
+            else:
+                existing = db_fetchone("SELECT model, api_key FROM ai_profiles WHERE name = %s", (name,))
+                if not model:
+                    model = (existing[0] if existing and existing[0] else DEFAULT_MODELS[provider])
+                if not key:
+                    key = (existing[1] if existing else '') or ''
+                if not key:
+                    message = "❌ API 키를 입력해주세요. (신규 등록은 키가 필요합니다)"
+                else:
+                    upsert_profile(name, provider, model, key)
+                    if activate:
+                        set_setting("active_profile", name)
+                    verb = "수정" if existing else "등록"
+                    message = f"✅ '{name}' {verb} 완료 ({provider}/{model})" + (" — 활성화됨" if activate else "")
+
+        elif action == 'delete_profile':
+            target = (request.form.get('del_name') or '').strip()
+            if not target:
+                message = "❌ 삭제할 툴 이름을 입력해주세요."
+            elif not db_fetchone("SELECT name FROM ai_profiles WHERE name = %s", (target,)):
+                message = f"❌ '{target}' 툴을 찾을 수 없습니다."
+            else:
+                delete_profile(target)
+                message = f"✅ '{target}' 툴을 삭제했습니다."
+
+        # ── 사용자 관리 ──
         elif action == 'create_user':
             new_user = (request.form.get('new_username') or '').strip()
             new_pin = (request.form.get('new_pin') or '').strip()
@@ -536,13 +686,17 @@ def admin():
             else:
                 db_execute("DELETE FROM users WHERE username = %s", (target,))
                 message = f"✅ '{target}' 아이디를 삭제했습니다."
+
     profiles_view = [{"name": p["name"], "provider": p["provider"], "model": p["model"],
-                      "key_ok": bool(p.get("api_key")) and "여기에" not in p.get("api_key", "")}
-                     for p in profile_data.get("profiles", [])]
+                      "key_ok": bool(p["api_key"].strip()),
+                      "masked": mask_key(p["api_key"])}
+                     for p in list_profiles()]
     user_rows = db_fetchall("SELECT username, wins, losses, points FROM users ORDER BY username")
     users_view = [{"username": r[0], "wins": r[1], "losses": r[2], "points": r[3]} for r in user_rows]
     return render_template_string(ADMIN_TEMPLATE, profiles=profiles_view, users=users_view,
-                                  active=profile_data.get("active", "테스트 모드"), message=message)
+                                  active=get_active_name(), message=message,
+                                  providers=PROVIDERS, default_models=DEFAULT_MODELS)
+
 
 @app.route('/admin/rooms', methods=['POST'])
 def admin_rooms():
@@ -559,6 +713,7 @@ def admin_rooms():
         })
     return jsonify({'rooms': room_list})
 
+
 @app.route('/history')
 def history():
     rows = db_fetchall("SELECT played_at, topic, player_a, player_b, side_a, side_b, log_json, winner, reason, engine "
@@ -573,10 +728,12 @@ def history():
                          "side_a": r[4], "side_b": r[5], "logs": logs, "winner": r[7], "reason": r[8], "engine": r[9]})
     return render_template_string(HISTORY_TEMPLATE, debates=debates)
 
+
 @app.route('/leaderboard')
 def leaderboard():
     rows = db_fetchall("SELECT username, wins, losses, points FROM users ORDER BY points DESC")
     return jsonify([{"username": r[0], "wins": r[1], "losses": r[2], "points": r[3]} for r in rows])
+
 
 def close_room(room_id):
     room = rooms.pop(room_id, None)
@@ -587,6 +744,7 @@ def close_room(room_id):
 def make_reveal_text(room):
     a, b = room['players'][0], room['players'][1]
     return f"🎭 정체 공개!\n{a['alias']} ({a['side']}) = {a['username']}\n{b['alias']} ({b['side']}) = {b['username']}"
+
 
 @socketio.on('login')
 def handle_login(data):
@@ -610,6 +768,7 @@ def handle_login(data):
     emit('login_ok', {'username': username,
                       'wins': stats['wins'], 'losses': stats['losses'],
                       'points': stats['points'], 'rank': stats['rank']})
+
 
 @socketio.on('join_queue')
 def handle_join_queue(data):
@@ -647,6 +806,7 @@ def handle_join_queue(data):
                              'my_side': p2['side'], 'opp_side': p1['side'],
                              'stage': STAGES[0], 'stage_index': 0, 'total_stages': TOTAL_STAGES}, room=p2['sid'])
 
+
 @socketio.on('admin_watch')
 def handle_admin_watch(data):
     if data.get('code') != ADMIN_CODE:
@@ -660,6 +820,7 @@ def handle_admin_watch(data):
     join_room(f"watch_{room_id}")
     history_logs = [{'stage': l['stage'], 'side': l['side'], 'message': l['text']} for l in room['logs']]
     emit('admin_history', {'topic': room['topic'], 'logs': history_logs})
+
 
 @socketio.on('send_message')
 def handle_send_message(data):
@@ -706,6 +867,7 @@ def handle_send_message(data):
         if stage_completed:
             emit('admin_stage', {'stage': new_stage}, room=f"watch_{room_id}")
 
+
 @socketio.on('disconnect')
 def handle_disconnect(*args):
     sid = request.sid
@@ -724,6 +886,7 @@ def handle_disconnect(*args):
         emit('opponent_left', {'reveal': reveal}, room=stayer['sid'])
         emit('admin_end', {'result': f"{leaver['username']} 퇴장으로 종료\n\n{reveal}"}, room=f"watch_{room_id}")
         close_room(room_id)
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
