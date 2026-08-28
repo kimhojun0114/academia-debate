@@ -53,16 +53,13 @@ RECONNECT_GRACE_SECONDS = 180
 STAGES = ["입론", "반론", "반박", "최종변론"]
 TOTAL_STAGES = len(STAGES)
 TURN_SECONDS = 300              # 기본 발언 시간
-OPENING_FIRST_SECONDS = 420     # 입론 — 먼저 발언하는 쪽 (7분)
-OPENING_SECOND_SECONDS = 20     # 입론 — 나중에 발언하는 쪽 (그동안 같이 작성했으므로 짧게)
+OPENING_SECONDS = 420           # 입론 — 양쪽 모두 7분
 MIN_MESSAGE_LENGTH = 30        # 이보다 짧은 발언은 반려한다
 TIMEOUT_MESSAGE = "(시간 초과)"  # 시간 초과 자동 전송은 길이 검사에서 예외
 
 def turn_limit(stage_index, speaker_idx):
-    """단계와 발언 순서에 따른 제한 시간."""
-    if stage_index == 0:
-        return OPENING_FIRST_SECONDS if speaker_idx == 0 else OPENING_SECOND_SECONDS
-    return TURN_SECONDS
+    """단계별 제한 시간. 입론은 양쪽 다 7분, 나머지는 5분."""
+    return OPENING_SECONDS if stage_index == 0 else TURN_SECONDS
 
 
 JUDGE_CRITERIA = [
