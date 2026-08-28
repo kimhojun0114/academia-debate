@@ -45,6 +45,9 @@ DEPRECATED_MODELS = {
                "gemini-2.5-pro", "gemini-1.5-pro"],
 }
 
+# 과부하(503)로 막힐 때 순서대로 넘어가며 시도할 모델
+GEMINI_FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+
 ALIAS_POOL = [
     "대한민국의 첫 번째 왕좌를 차지한 자", "왕좌를 놓지 않는 건국의 노인",
     "왕좌에서 내려오기를 끝까지 거부한 노회한 독재자", "한강의 다리를 건너간 도망의 성자",
@@ -189,6 +192,65 @@ def mask_key(key):
 # ─────────────────────────────────────────────
 # LLM 호출
 # ─────────────────────────────────────────────
+def _is_auth_error(e):
+    s = str(e)
+    return "401" in s or "UNAUTHENTICATED" in s or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in s
+
+def _is_busy_error(e):
+    """일시적 과부하/한도 초과 — 잠시 후 재시도하면 풀릴 수 있는 오류."""
+    s = str(e)
+    return ("503" in s or "UNAVAILABLE" in s or "overloaded" in s.lower()
+            or "429" in s or "RESOURCE_EXHAUSTED" in s)
+
+def _pause(seconds):
+    """gevent 워커를 막지 않는 대기."""
+    try:
+        socketio.sleep(seconds)
+    except Exception:
+        import time
+        time.sleep(seconds)
+
+
+def _gemini_once(api_key, model, prompt):
+    """API 버전을 순차 시도. 인증 오류일 때만 다음 버전으로 넘어간다."""
+    from google import genai
+    from google.genai import types as genai_types
+    last_err = None
+    for api_version in (None, "v1", "v1alpha"):
+        kwargs = {"api_key": api_key}
+        if api_version:
+            kwargs["http_options"] = genai_types.HttpOptions(api_version=api_version)
+        try:
+            client = genai.Client(**kwargs)
+            return client.models.generate_content(model=model, contents=prompt).text.strip()
+        except Exception as e:
+            last_err = e
+            if not _is_auth_error(e):
+                raise
+    raise last_err
+
+
+def _gemini_call(api_key, model, prompt):
+    """과부하(503)면 잠시 쉬었다 재시도하고, 계속 막히면 다른 모델로 넘어간다."""
+    candidates = [model] + [m for m in GEMINI_FALLBACK_MODELS if m != model]
+    last_err = None
+    for idx, candidate in enumerate(candidates):
+        for attempt in range(3):
+            try:
+                return _gemini_once(api_key, candidate, prompt)
+            except Exception as e:
+                last_err = e
+                if _is_busy_error(e) and attempt < 2:
+                    wait = 1.5 * (attempt + 1)
+                    print(f"[Gemini 과부하] {candidate} 재시도 {attempt + 1}/2 ({wait}초 후)")
+                    _pause(wait)
+                    continue
+                if _is_busy_error(e) and idx < len(candidates) - 1:
+                    print(f"[Gemini 과부하] {candidate} → 다음 모델로 전환")
+                break
+    raise last_err
+
+
 def llm_call(prompt, max_tokens=600, raise_errors=False):
     profile = get_active_profile()
     if not profile:
@@ -210,10 +272,7 @@ def llm_call(prompt, max_tokens=600, raise_errors=False):
                                   messages=[{"role": "user", "content": prompt}])
             return r.content[0].text.strip()
         elif provider == "gemini":
-            from google import genai
-            c = genai.Client(api_key=profile["api_key"])
-            r = c.models.generate_content(model=profile["model"], contents=prompt)
-            return r.text.strip()
+            return _gemini_call(profile["api_key"], profile["model"], prompt)
         else:
             if raise_errors:
                 raise RuntimeError(f"지원하지 않는 제공사: {provider}")
@@ -380,6 +439,10 @@ button{-webkit-appearance:none;appearance:none;border:1px solid #93c5fd;border-r
   background:#2563eb;color:#ffffff !important;-webkit-text-fill-color:#ffffff;
   cursor:pointer;font-size:15px;font-weight:bold;font-family:inherit;}
 button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
+.summary-item.pending{color:#9ca3af;font-style:italic;}
+@keyframes fadePulse{0%,100%{opacity:.45;}50%{opacity:1;}}
+.summary-item.pending{animation:fadePulse 1.4s ease-in-out infinite;}
+#chat-box{scroll-behavior:smooth;}
 </style>
 </head>
 <body>
@@ -406,8 +469,8 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
   <p id="role-area" style="font-weight:bold;color:#4b5563;"></p>
   <p id="turn-status" style="color:#dc2626;font-weight:bold;margin-bottom:15px;"></p>
   <div id="chat-box"></div>
-  <textarea id="msg-input" style="width:96%;height:70px;padding:10px;border-radius:6px;border:1px solid #ccc;" placeholder="여기에 논리를 펼쳐주세요 (복사/붙여넣기 금지)"></textarea>
-  <button id="send-btn" onclick="sendMessage()" style="width:100%;margin-top:8px;padding:10px;background:#2563eb;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">발언 완료 (상대방에게 전송)</button>
+  <textarea id="msg-input" style="width:96%;height:70px;padding:10px;border-radius:6px;border:1px solid #ccc;" placeholder="여기에 논리를 펼쳐주세요 (복사/붙여넣기 금지)&#10;엔터는 줄바꿈, Ctrl(⌘)+엔터로 전송"></textarea>
+  <button id="send-btn" onclick="sendMessage()" style="width:100%;margin-top:8px;padding:10px;background:#2563eb;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">발언 완료 — 전송 (Ctrl+Enter)</button>
 </div>
 <script>
 document.addEventListener('contextmenu',e=>{e.preventDefault();alert('우클릭 금지');});
@@ -423,6 +486,10 @@ document.addEventListener('beforeinput',e=>{
 });
 document.addEventListener('keydown',e=>{
   const isCtrl=e.ctrlKey||e.metaKey,key=e.key.toLowerCase(),isTyping=['INPUT','TEXTAREA'].includes(e.target.tagName);
+  if(isCtrl&&key==='enter'){e.preventDefault();
+    const btn=document.getElementById('send-btn');
+    if(btn&&!btn.disabled)sendMessage();
+    return;}
   if(isCtrl&&key==='a'&&isTyping)return;
   if(isCtrl&&['c','v','x','a'].includes(key)){e.preventDefault();alert('⚠️ 단축키 금지!');}
 });
@@ -477,8 +544,19 @@ socket.on('receive_message',d=>{const cb=document.getElementById('chat-box');
   const ne=document.createElement('strong');ne.innerHTML="<span class='stage-label'>["+d.stage+"]</span> "+d.sender+': ';
   const te=document.createElement('span');te.textContent=d.message;
   md.appendChild(ne);md.appendChild(te);cb.appendChild(md);
-  const sd=document.createElement('div');sd.className='summary-item';sd.textContent='🤖 AI 요약: '+d.summary;
+  const sd=document.createElement('div');sd.className='summary-item pending';
+  sd.id='sum-'+d.msg_id;sd.textContent='🤖 AI 요약 생성 중...';
   cb.appendChild(sd);cb.scrollTop=cb.scrollHeight;});
+socket.on('receive_summary',d=>{const sd=document.getElementById('sum-'+d.msg_id);
+  if(!sd)return;sd.classList.remove('pending');sd.textContent='🤖 AI 요약: '+d.summary;
+  const cb=document.getElementById('chat-box');cb.scrollTop=cb.scrollHeight;});
+socket.on('judging',d=>{stopTimer();
+  document.getElementById('turn-status').innerText="⚖️ "+d.msg;
+  document.getElementById('msg-input').disabled=true;
+  document.getElementById('send-btn').disabled=true;
+  const cb=document.getElementById('chat-box');
+  const el=document.createElement('div');el.className='summary-item pending';
+  el.textContent='⚖️ '+d.msg;cb.appendChild(el);cb.scrollTop=cb.scrollHeight;});
 socket.on('opponent_left',d=>{stopTimer();alert("🚪 상대방이 떠나 몰수승!\\n\\n"+d.reveal);location.reload();});
 socket.on('debate_end',d=>{stopTimer();alert("🔔 토론 완료! (+5점)\\n\\n[AI 판정]\\n"+d.result);location.reload();});
 </script>
@@ -886,6 +964,33 @@ def handle_admin_watch(data):
     emit('admin_history', {'topic': room['topic'], 'logs': history_logs})
 
 
+def summarize_in_background(room_id, msg_id, text):
+    """AI 요약을 따로 돌려 준비되는 대로 채워 넣는다."""
+    summary = get_ai_summary(text)
+    socketio.emit('receive_summary', {'msg_id': msg_id, 'summary': summary}, room=room_id)
+
+
+def judge_in_background(room_id):
+    """AI 심사를 따로 돌린다. 그동안 참가자에게는 심사 중 안내가 떠 있다."""
+    room = rooms.get(room_id)
+    if not room:
+        return
+    winner_side, result_text = judge_debate(room['topic'], room['logs'])
+    player_a, player_b = room['players'][0], room['players'][1]
+    add_points(player_a['username'], 5)
+    add_points(player_b['username'], 5)
+    if winner_side == player_a['side']:
+        record_win_loss(player_a['username'], player_b['username'])
+    elif winner_side == player_b['side']:
+        record_win_loss(player_b['username'], player_a['username'])
+    final_text = result_text + "\n\n" + make_reveal_text(room)
+    save_debate(room['topic'], player_a['username'], player_b['username'],
+                player_a['side'], player_b['side'], room['logs'], winner_side, final_text)
+    socketio.emit('debate_end', {'result': final_text}, room=room_id)
+    socketio.emit('admin_end', {'result': final_text}, room=f"watch_{room_id}")
+    close_room(room_id)
+
+
 @socketio.on('send_message')
 def handle_send_message(data):
     room_id = data.get('room_id')
@@ -899,28 +1004,24 @@ def handle_send_message(data):
         emit('error_msg', {'msg': '지금은 당신의 발언 차례가 아닙니다.'})
         return
     stage_name = STAGES[room['turn_count']]
-    summary = get_ai_summary(msg_text)
+    msg_id = uuid.uuid4().hex[:12]
     room['logs'].append({"side": speaker['side'], "stage": stage_name, "text": msg_text})
-    emit('receive_message', {'sender': speaker['alias'], 'message': msg_text, 'summary': summary, 'stage': stage_name}, room=room_id)
+
+    # 발언은 즉시 전달하고, 느린 AI 요약은 백그라운드에서 채워 넣는다
+    emit('receive_message', {'sender': speaker['alias'], 'message': msg_text,
+                             'msg_id': msg_id, 'stage': stage_name}, room=room_id)
     emit('admin_message', {'side': speaker['side'], 'message': msg_text, 'stage': stage_name}, room=f"watch_{room_id}")
+    socketio.start_background_task(summarize_in_background, room_id, msg_id, msg_text)
+
     stage_completed = (speaker_idx == 1)
     if stage_completed:
         room['turn_count'] += 1
     if room['turn_count'] >= TOTAL_STAGES:
-        winner_side, result_text = judge_debate(room['topic'], room['logs'])
-        player_a, player_b = room['players'][0], room['players'][1]
-        add_points(player_a['username'], 5)
-        add_points(player_b['username'], 5)
-        if winner_side == player_a['side']:
-            record_win_loss(player_a['username'], player_b['username'])
-        elif winner_side == player_b['side']:
-            record_win_loss(player_b['username'], player_a['username'])
-        final_text = result_text + "\n\n" + make_reveal_text(room)
-        save_debate(room['topic'], player_a['username'], player_b['username'],
-                    player_a['side'], player_b['side'], room['logs'], winner_side, final_text)
-        emit('debate_end', {'result': final_text}, room=room_id)
-        emit('admin_end', {'result': final_text}, room=f"watch_{room_id}")
-        close_room(room_id)
+        # 심사도 느리므로 안내를 먼저 띄우고 백그라운드에서 처리
+        room['judging'] = True
+        emit('judging', {'msg': 'AI가 토론을 심사하고 있습니다...'}, room=room_id)
+        emit('admin_stage', {'stage': 'AI 심사 중'}, room=f"watch_{room_id}")
+        socketio.start_background_task(judge_in_background, room_id)
     else:
         room['current_speaker'] = 1 - speaker_idx
         next_idx = room['current_speaker']
@@ -940,6 +1041,9 @@ def handle_disconnect(*args):
     room_id = sid_to_room.get(sid)
     if room_id and room_id in rooms:
         room = rooms[room_id]
+        if room.get('judging'):
+            # 심사가 진행 중이면 퇴장으로 몰수 처리하지 않는다
+            return
         leaver = next(p for p in room['players'] if p['sid'] == sid)
         stayer = next(p for p in room['players'] if p['sid'] != sid)
         record_win_loss(stayer['username'], leaver['username'])
