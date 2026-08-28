@@ -336,20 +336,21 @@ def max_rpm():
     except (TypeError, ValueError):
         return 15
 
-def rate_gate(priority="high"):
-    """호출 허가. 낮은 우선순위(요약)는 붐비면 그냥 포기한다."""
+def rate_gate(priority="high", max_wait=70):
+    """
+    호출 허가. 낮은 우선순위(요약)는 붐비면 즉시 포기한다.
+    높은 우선순위도 무한정 기다리지 않는다 — 최대 max_wait초.
+    """
     limit = max_rpm()
-    for _ in range(40):
-        used = current_rpm()
-        if used < limit:
+    deadline = time.time() + max_wait
+    while True:
+        if current_rpm() < limit:
             _call_times.append(time.time())
             return True
-        if priority == "low":
+        if priority == "low" or time.time() >= deadline:
             return False
-        # 높은 우선순위(심사·주제)는 가장 오래된 호출이 만료될 때까지 기다린다
         wait = max(0.5, 60 - (time.time() - _call_times[0]) + 0.3)
-        _pause(min(wait, 10))
-    return False
+        _pause(min(wait, 10, max(0.5, deadline - time.time())))
 
 def _pause(seconds):
     """gevent 워커를 막지 않는 대기."""
@@ -549,14 +550,17 @@ def save_debate(topic, player_a, player_b, side_a, side_b, logs, winner, reason)
 
 init_db()
 seed_default_profile()
+# 서버가 뜨자마자 주제를 미리 만들어둔다 (첫 매칭부터 AI 주제가 나오도록)
+socketio.start_background_task(lambda: refill_topic_cache())
 
 
 # ─────────────────────────────────────────────
 # AI 기능
 # ─────────────────────────────────────────────
-def get_ai_topic():
+def get_ai_topic(allow_fallback=True, priority="high"):
     recent_rows = db_fetchall("SELECT topic FROM debates ORDER BY id DESC LIMIT 30")
-    recent_topics = list(dict.fromkeys(r[0] for r in recent_rows))[:15]
+    # 이미 창고에 쌓아둔 주제도 제외 대상에 넣어야 7개가 서로 다르게 만들어진다
+    recent_topics = list(dict.fromkeys(list(topic_cache) + [r[0] for r in recent_rows]))[:20]
     recent_list = "\n".join(f"- {t}" for t in recent_topics) if recent_topics else "(없음)"
     prompt = f"""고등학생 토론 동아리의 1대1 즉흥 찬반 토론에 쓸 주제를 하나 추천해줘.
 
@@ -572,11 +576,13 @@ def get_ai_topic():
 다른 설명 없이 주제 제목 한 줄만 출력해."""
     started = time.time()
     try:
-        result = llm_call(prompt, raise_errors=True)
+        result = llm_call(prompt, raise_errors=True, priority=priority)
         log_ai_call("주제추천", True, "", (time.time() - started) * 1000)
         return result.strip().strip('"').strip("'").splitlines()[0]
     except Exception as e:
         log_ai_call("주제추천", False, f"{type(e).__name__}: {e}", (time.time() - started) * 1000)
+        if not allow_fallback:
+            return None   # 창고를 채우는 중이었다면 예비 주제로 채우지 않고 나중에 다시 시도
         # AI가 안 되면 미리 준비된 주제 중 최근에 안 쓴 것을 고른다
         unused = [t for t in BACKUP_TOPICS if t not in recent_topics]
         return random.choice(unused or BACKUP_TOPICS)
@@ -584,6 +590,43 @@ def get_ai_topic():
 
 def summaries_enabled():
     return get_setting("summary_enabled", "1") != "0"
+
+
+# ── 주제 미리 만들어두기 ──────────────────────────────────
+# 매칭 도중에 AI를 기다리면, 한도에 걸렸을 때 두 사람이 몇 분씩 묶인다.
+# 그래서 주제는 평소에 미리 만들어 쌓아두고, 매칭 때는 꺼내 쓰기만 한다.
+TOPIC_CACHE_SIZE = 7
+topic_cache = []
+_refilling = {"on": False}
+
+def take_topic():
+    """즉시 반환. 쌓인 게 없으면 예비 주제를 쓴다."""
+    topic = topic_cache.pop(0) if topic_cache else random.choice(BACKUP_TOPICS)
+    socketio.start_background_task(refill_topic_cache)
+    return topic
+
+def refill_topic_cache():
+    if _refilling["on"]:
+        return
+    _refilling["on"] = True
+    try:
+        misses = 0
+        while len(topic_cache) < TOPIC_CACHE_SIZE:
+            # 창고 채우기는 낮은 우선순위 — 심사·주제 즉시 요청이 밀리지 않게 한다.
+            # 실패하면 예비 주제로 채우지 않고 멈춘다 (다음 매칭 때 다시 시도)
+            topic = get_ai_topic(allow_fallback=False, priority="low")
+            if not topic:
+                break
+            if topic in topic_cache:
+                misses += 1
+                if misses >= 2:
+                    break   # 같은 주제만 반복되면 그만
+                continue
+            topic_cache.append(topic)
+    except Exception as e:
+        print(f"[주제 준비 실패] {e}")
+    finally:
+        _refilling["on"] = False
 
 
 def get_ai_summary(text):
@@ -850,6 +893,12 @@ socket.on('opponent_reconnected',()=>{oppGone=false;
 socket.on('error_msg',d=>alert(d.msg));
 function joinQueue(){socket.emit('join_queue',{});document.getElementById('match-btn').disabled=true;}
 socket.on('status',d=>{document.getElementById('queue-text').innerText=d.msg;});
+// 매칭이 실패해 대기열로 돌아갔을 때 자동으로 다시 시도
+socket.on('rejoin_queue',()=>{setTimeout(()=>{
+  if(!currentRoom)socket.emit('join_queue',{});},3000);});
+// 매칭 버튼이 눌린 채 잠기지 않도록, 방이 안 생겼으면 다시 누를 수 있게 풀어준다
+socket.on('error_msg',()=>{if(!currentRoom){
+  const b=document.getElementById('match-btn');if(b)b.disabled=false;}});
 function renderStageDots(idx,total){
   const wrap=document.getElementById('stage-dots');wrap.innerHTML='';
   for(let i=0;i<total;i++){const dot=document.createElement('div');
@@ -1507,10 +1556,24 @@ def handle_join_queue(data):
     if any(p['sid'] == user_sid for p in waiting_pool) or user_sid in sid_to_room:
         return
     waiting_pool.append({"sid": user_sid, "username": username})
-    emit('status', {'msg': '대기열에서 상대방 매칭을 기다리는 중...'})
+    emit('status', {'msg': f'대기열에서 상대방 매칭을 기다리는 중... (대기 {len(waiting_pool)}명)'})
     if len(waiting_pool) >= 2:
         p1 = waiting_pool.pop(random.randint(0, len(waiting_pool) - 1))
         p2 = waiting_pool.pop(random.randint(0, len(waiting_pool) - 1))
+        try:
+            start_debate(p1, p2)
+        except Exception as e:
+            # 방을 못 만들면 두 사람을 대기열로 되돌린다 (사라져서 영영 매칭 안 되는 것 방지)
+            print(f"[매칭 실패] {type(e).__name__}: {e}")
+            waiting_pool.extend([p1, p2])
+            for p in (p1, p2):
+                socketio.emit('error_msg',
+                              {'msg': '매칭 중 문제가 생겨 대기열로 돌아갔습니다. 잠시 후 자동으로 다시 시도됩니다.'},
+                              room=p['sid'])
+                socketio.emit('rejoin_queue', {}, room=p['sid'])
+
+
+def start_debate(p1, p2):
         title_a, title_b = random.sample(ALIAS_POOL, 2)
         side_a, side_b = random.sample(["찬성", "반대"], 2)
         p1['alias'] = title_a
@@ -1518,7 +1581,7 @@ def handle_join_queue(data):
         p1['side'] = side_a
         p2['side'] = side_b
         room_id = f"room_{uuid.uuid4().hex[:8]}"
-        topic = get_ai_topic()
+        topic = take_topic()          # 미리 만들어둔 주제 — 기다리지 않는다
         p1['connected'] = True
         p2['connected'] = True
         rooms[room_id] = {"players": [p1, p2], "turn_count": 0, "current_speaker": 0,
