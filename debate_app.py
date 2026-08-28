@@ -169,9 +169,11 @@ def mask_key(key):
 # ─────────────────────────────────────────────
 # LLM 호출
 # ─────────────────────────────────────────────
-def llm_call(prompt, max_tokens=600):
+def llm_call(prompt, max_tokens=600, raise_errors=False):
     profile = get_active_profile()
     if not profile:
+        if raise_errors:
+            raise RuntimeError("활성 프로필이 없거나 API 키가 비어 있습니다.")
         return None
     provider = profile["provider"]
     try:
@@ -193,27 +195,46 @@ def llm_call(prompt, max_tokens=600):
             r = c.models.generate_content(model=profile["model"], contents=prompt)
             return r.text.strip()
         else:
+            if raise_errors:
+                raise RuntimeError(f"지원하지 않는 제공사: {provider}")
             return None
-    except ImportError:
-        print(f"[LLM 오류] {provider} SDK 미설치")
+    except ImportError as e:
+        print(f"[LLM 오류] {provider} SDK 미설치: {e}")
+        if raise_errors:
+            raise
         return None
     except Exception as e:
         print(f"[LLM 호출 실패] {provider}: {e}")
+        if raise_errors:
+            raise
         return None
 
 
+def _sdk_version(provider):
+    pkg = {"gemini": "google-genai", "openai": "openai", "anthropic": "anthropic"}.get(provider)
+    if not pkg:
+        return "?"
+    try:
+        import importlib.metadata as md
+        return md.version(pkg)
+    except Exception:
+        return "미설치"
+
+
 def test_llm_connection():
-    """관리자 페이지의 '연결 테스트' 버튼용."""
+    """관리자 페이지의 '연결 테스트' 버튼용. 실패 원인을 화면에 그대로 표시."""
     profile = get_active_profile()
     if not profile:
         return False, "활성 프로필이 없거나 API 키가 비어 있습니다."
+    info = (f"프로필 {profile['name']} | {profile['provider']} / {profile['model']} | "
+            f"SDK {_sdk_version(profile['provider'])} | 키 {mask_key(profile['api_key'])}")
     try:
-        result = llm_call("'연결 성공'이라고만 답해.", max_tokens=50)
+        result = llm_call("'연결 성공'이라고만 답해.", max_tokens=50, raise_errors=True)
         if result:
-            return True, f"응답: {result[:60]}"
-        return False, "응답이 비어 있습니다. 서버 로그의 [LLM 호출 실패] 메시지를 확인하세요."
+            return True, f"{info}\n응답: {result[:80]}"
+        return False, f"{info}\n예외 없이 빈 응답이 돌아왔습니다."
     except Exception as e:
-        return False, str(e)[:200]
+        return False, f"{info}\n{type(e).__name__}: {str(e)[:500]}"
 
 
 # ─────────────────────────────────────────────
@@ -449,7 +470,10 @@ ADMIN_TEMPLATE = """<!DOCTYPE html>
 <style>body{font-family:'Malgun Gothic',sans-serif;max-width:700px;margin:30px auto;padding:20px;background:#f3f4f6;}
 .box{border:1px solid #e5e7eb;padding:20px;background:white;margin-bottom:15px;border-radius:12px;}
 .profile{padding:10px;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:8px;}
-.active{border:2px solid #2563eb;background:#eff6ff;}.ok{color:#16a34a}.bad{color:#dc2626}.msg{color:#2563eb;font-weight:bold;}
+.active{border:2px solid #2563eb;background:#eff6ff;}.ok{color:#16a34a}.bad{color:#dc2626}
+.msg{color:#1e3a8a;font-weight:bold;white-space:pre-line;background:#eff6ff;
+  border:1px solid #bfdbfe;border-radius:8px;padding:12px;font-size:0.92em;
+  word-break:break-word;overflow-wrap:anywhere;}
 table{width:100%;border-collapse:collapse;margin-bottom:14px;font-size:0.9em;}
 th{text-align:left;border-bottom:1px solid #e5e7eb;padding:4px;}
 td{border-bottom:1px solid #f3f4f6;padding:4px;}
