@@ -23,7 +23,12 @@ import hmac
 import secrets
 import hashlib
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+KST = timezone(timedelta(hours=9))
+
+def now_kst():
+    """Render 서버는 세계 표준시(UTC)라서, 기록 시각은 한국 시간으로 직접 맞춘다."""
+    return datetime.now(KST)
 from flask import Flask, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit, join_room
 
@@ -323,7 +328,7 @@ def log_ai_call(kind, ok, error="", ms=0):
     try:
         db_execute("INSERT INTO ai_calls (called_at, kind, ok, engine, model, error, ms) "
                    "VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                   (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), kind, ok,
+                   (now_kst().strftime("%Y-%m-%d %H:%M:%S"), kind, ok,
                     get_active_name(), model, (error or "")[:400], int(ms)))
         # 오래된 기록 정리 (최근 300건만 유지)
         db_execute("DELETE FROM ai_calls WHERE id < "
@@ -337,7 +342,7 @@ def ai_call_summary():
     """관리자 화면에 보여줄 최근 AI 호출 통계."""
     rows = db_fetchall("SELECT kind, ok, COUNT(*) FROM ai_calls "
                        "WHERE called_at >= %s GROUP BY kind, ok",
-                       (datetime.now().strftime("%Y-%m-%d 00:00:00"),))
+                       (now_kst().strftime("%Y-%m-%d 00:00:00"),))
     stats = {}
     for kind, ok, cnt in rows:
         s = stats.setdefault(kind, {"ok": 0, "fail": 0})
@@ -627,7 +632,7 @@ def save_debate(topic, player_a, player_b, side_a, side_b, logs, winner, reason,
     row = db_execute_returning(
         "INSERT INTO debates (played_at, topic, player_a, player_b, side_a, side_b, log_json, "
         "winner, reason, engine, pending_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-        (datetime.now().strftime("%Y-%m-%d %H:%M"), topic, player_a, player_b, side_a, side_b,
+        (now_kst().strftime("%Y-%m-%d %H:%M"), topic, player_a, player_b, side_a, side_b,
          json.dumps(logs, ensure_ascii=False), winner, reason, engine,
          json.dumps(pending, ensure_ascii=False) if pending else None))
     return row[0] if row else None
@@ -804,8 +809,10 @@ def draws_allowed():
 def _judge_schema(allow_draw):
     winners = ["찬성", "반대"] + (["무승부"] if allow_draw else [])
     item_keys = [k for _, items in RUBRIC for k, _, _ in items]
+    max_of = {k: pts for _, items in RUBRIC for k, _, pts in items}
     side_obj = {"type": "object", "additionalProperties": False, "required": item_keys,
-                "properties": {k: {"type": "integer"} for k in item_keys}}
+                "properties": {k: {"type": "integer", "description": f"0~{max_of[k]}점 사이 정수"}
+                               for k in item_keys}}
     return {
         "name": "debate_verdict",
         "strict": True,
@@ -901,6 +908,8 @@ def judge_debate(topic, logs):
 {log_text}
 
 reason에는 승패를 가른 결정적 차이를 단계별 근거와 함께 5문장 이내로 쓴다.
+reason에는 점수·총점 숫자를 쓰지 않는다 (점수는 서버가 따로 계산해 보여준다).
+각 항목 점수는 반드시 그 항목의 배점을 넘지 않게 매긴다 (예: 5점 만점 항목에 6점 이상 금지).
 반드시 지정된 JSON 형식으로만 답하라. pro와 con에는 위 채점표의 키마다 정수 점수를 넣는다."""
     schema = _judge_schema(allow_draw)
     last_error = ""
@@ -1726,9 +1735,10 @@ function renderPending(list){
     if(p.winner==='판정대기'){const pd=p.pending||{};
       return "<div class='pend'>"+head+"<div class='why'>⚠️ AI 지적: <b>"+esc(pd.no_will_side)+"</b>측 토론 의지 없음\n"+
         esc(pd.no_will_reason||'')+"\n\n[AI 원래 판정]\n"+esc(pd.text||'')+"</div>"+
-        "<button class='red' onclick=\"resolve("+p.id+",'forfeit_pro')\">찬성 몰수패</button>"+
-        "<button class='red' onclick=\"resolve("+p.id+",'forfeit_con')\">반대 몰수패</button>"+
+        forfeitButtons(p)+
         "<button class='sub' onclick=\"resolve("+p.id+",'dismiss')\">기각 → AI 판정대로</button>"+
+        "<p class='hint' style='margin:6px 0 0;'><b>몰수패</b>: 상대가 승리 + 심사 점수, 몰수된 쪽은 점수 0점 · 기록에 '몰수승'<br>"+
+        "<b>기각</b>: AI 판정대로 승패, 양쪽 모두 심사 점수를 받음 · 정상 경기로 기록</p>"+
         "<button class='sub' onclick='hidePending("+p.id+")'>목록에서 숨기기</button></div>";}
     return "<div class='pend fail'>"+head+"<div class='why'>"+esc((p.reason||'').split('\n\n')[0])+"</div>"+
       (p.rejudging?"<span class='hint'>⏳ 다시 심사하는 중...</span>":
@@ -1736,6 +1746,12 @@ function renderPending(list){
       " <button class='sub' onclick='hidePending("+p.id+")'>목록에서 숨기기</button></div>";
   }).join('');
 }
+function forfeitButtons(p){
+  const side=(p.pending||{}).no_will_side;
+  const sides=side==='둘다'?['찬성','반대']:(side==='찬성'||side==='반대')?[side]:[];
+  const user=s=>s===p.side_a?p.player_a:p.player_b;
+  return sides.map(s=>"<button class='red' onclick=\"resolve("+p.id+",'"+(s==='찬성'?'forfeit_pro':'forfeit_con')+"')\">"+
+    s+" ("+esc(user(s))+") 몰수패</button>").join('');}
 async function resolve(id,action){
   const label={forfeit_pro:'찬성측 몰수패',forfeit_con:'반대측 몰수패',dismiss:'기각(AI 판정 적용)'}[action];
   if(!confirm(label+'(으)로 처리할까요?'))return;
@@ -1955,10 +1971,11 @@ HISTORY_TEMPLATE = """<!DOCTYPE html>
 <h2>📚 지난 토론 기록 (최근 {{ debates|length }}건)</h2>
 {% for d in debates %}
 <div class="box"><b>📌 {{ d.topic }}</b>
-<p class="meta">{{ d.played_at }} | A: {{ d.player_a }} ({{ d.side_a }}) vs B: {{ d.player_b }} ({{ d.side_b }}) | 엔진: {{ d.engine }}</p>
+<p class="meta">{{ d.played_at }} | 찬성 {{ d.pro }} vs 반대 {{ d.con }} | 엔진: {{ d.engine }}</p>
 <p><b>결과: </b>{% if d.winner == '심사실패' %}<span class="winner-tag w-fail">⚠️ 심사 실패 (전적 미반영)</span>
 {% elif d.winner == '중단' %}<span class="winner-tag w-stop">⏹️ 중단 (전적 미반영)</span>
-{% else %}<b>{{ d.winner }}</b>{% endif %}</p>
+{% elif d.winner == '판정대기' %}<span class="winner-tag w-fail">⏳ 운영자 확인 중</span>
+{% else %}<b>{{ d.outcome }}</b>{% endif %}</p>
 <div class="reason">{{ d.reason }}</div>
 <details><summary>토론 전문 보기</summary>
 {% for line in d.logs %}<p class="log-line {{ 'pro' if line.side == '찬성' else 'con' }}"><b>[{{ line.stage }}] {{ line.side }}:</b> {{ line.text }}{% if line.auto %} <span class="sum">⏰ 시간 종료 자동 제출</span>{% endif %}{% if line.summary %}<br><span class="sum">🤖 요약: {{ line.summary }}</span>{% endif %}</p>{% endfor %}
@@ -1983,8 +2000,17 @@ def history():
             logs = json.loads(r[6])
         except Exception:
             logs = []
-        debates.append({"played_at": r[0], "topic": r[1], "player_a": r[2], "player_b": r[3],
-                         "side_a": r[4], "side_b": r[5], "logs": logs, "winner": r[7], "reason": r[8], "engine": r[9]})
+        by_side = {r[4]: r[2], r[5]: r[3]}
+        winner, reason = r[7], r[8] or ""
+        if winner in ("찬성", "반대"):
+            outcome = f"{winner} 승 — {by_side.get(winner, '?')}"
+        elif winner == "몰수":
+            outcome = "몰수 — " + reason.split("\n")[0]
+        else:
+            outcome = winner
+        debates.append({"played_at": r[0], "topic": r[1], "pro": by_side.get("찬성", "?"),
+                        "con": by_side.get("반대", "?"), "logs": logs, "winner": winner,
+                        "outcome": outcome, "reason": reason, "engine": r[9]})
     return render_template_string(HISTORY_TEMPLATE, debates=debates)
 
 
