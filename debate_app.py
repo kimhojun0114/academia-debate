@@ -142,13 +142,17 @@ BACKUP_TOPICS = [
 # 예전에는 조회할 때마다 DB에 새로 접속(보안 연결 포함)해서 버튼 하나에 수백 ms씩 걸렸다.
 # 접속을 몇 개 열어두고 돌려쓰면 그 대기 시간이 사라진다.
 from psycopg2 import pool as _pg_pool
+import threading as _threading
+DB_POOL_MAX = 10
 _pool = None
+# 연결이 모두 쓰이는 중이면 오류를 내지 않고 차례를 기다린다 (gevent에서도 다른 사람을 멈추지 않음)
+_pool_slots = _threading.BoundedSemaphore(DB_POOL_MAX)
 
 def _get_pool():
     global _pool
     if _pool is None:
         _pool = _pg_pool.ThreadedConnectionPool(
-            1, 8, DATABASE_URL, sslmode=os.environ.get("DB_SSLMODE", "require"),
+            1, DB_POOL_MAX, DATABASE_URL, sslmode=os.environ.get("DB_SSLMODE", "require"),
             keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
     return _pool
 
@@ -157,7 +161,13 @@ def _run(work):
     """풀에서 연결을 빌려 work(cursor)를 실행. 끊어진 연결이면 버리고 한 번 더 시도한다."""
     for attempt in range(2):
         p = _get_pool()
-        conn = p.getconn()
+        if not _pool_slots.acquire(timeout=30):
+            raise RuntimeError("DB 연결 대기 시간 초과")
+        try:
+            conn = p.getconn()
+        except Exception:
+            _pool_slots.release()
+            raise
         broken = False
         try:
             cur = conn.cursor()
@@ -180,6 +190,7 @@ def _run(work):
                 p.putconn(conn, close=broken or conn.closed != 0)
             except Exception:
                 pass
+            _pool_slots.release()
 
 
 def db_execute(query, params=()):
@@ -723,7 +734,7 @@ def summaries_enabled():
 # ── 주제 미리 만들어두기 ──────────────────────────────────
 # 매칭 도중에 AI를 기다리면, 한도에 걸렸을 때 두 사람이 몇 분씩 묶인다.
 # 그래서 주제는 평소에 미리 만들어 쌓아두고, 매칭 때는 꺼내 쓰기만 한다.
-TOPIC_CACHE_SIZE = 7
+TOPIC_CACHE_SIZE = 15
 topic_cache = []
 _refilling = {"on": False}
 
@@ -856,6 +867,11 @@ def _log_line(log):
     return line
 
 
+# 여러 판이 동시에 끝나도 심사 요청이 한꺼번에 몰리지 않게 동시에 3개까지만 보낸다
+_judge_slots = _threading.BoundedSemaphore(3)
+JUDGE_ATTEMPTS = 5
+
+
 def judge_debate(topic, logs):
     """
     반환: {"ok": bool, "winner": 찬성/반대/무승부, "text": 결과 문구,
@@ -913,10 +929,11 @@ reason에는 점수·총점 숫자를 쓰지 않는다 (점수는 서버가 따�
 반드시 지정된 JSON 형식으로만 답하라. pro와 con에는 위 채점표의 키마다 정수 점수를 넣는다."""
     schema = _judge_schema(allow_draw)
     last_error = ""
-    for attempt in range(3):
+    for attempt in range(JUDGE_ATTEMPTS):
         started = time.time()
         try:
-            raw = llm_call(prompt, raise_errors=True, json_schema=schema)
+            with _judge_slots:
+                raw = llm_call(prompt, raise_errors=True, json_schema=schema)
             data = json.loads(raw.replace("```json", "").replace("```", "").strip())
             if not isinstance(data.get("pro"), dict) or not isinstance(data.get("con"), dict):
                 raise ValueError("항목별 점수가 없습니다")
@@ -954,10 +971,11 @@ reason에는 점수·총점 숫자를 쓰지 않는다 (점수는 서버가 따�
             log_ai_call("심사", False, last_error, (time.time() - started) * 1000)
             if isinstance(e, QuotaExceeded) and not e.retry_after:
                 break   # 크레딧 소진은 기다려도 안 풀린다
-            if attempt < 2:
-                wait = e.retry_after if isinstance(e, QuotaExceeded) else 2 * (attempt + 1)
-                print(f"[심사 재시도] {wait:.0f}초 대기")
-                _pause(max(wait, 1))
+            if attempt < JUDGE_ATTEMPTS - 1:
+                backoff = [5, 10, 20, 30][min(attempt, 3)]   # 점점 길게 기다린다 (총 1분 남짓)
+                wait = max(backoff, e.retry_after if isinstance(e, QuotaExceeded) else 0)
+                print(f"[심사 재시도 {attempt + 1}] {wait:.0f}초 대기")
+                _pause(wait)
 
     hint = explain_ai_error(Exception(last_error))
     return {"ok": False, "winner": "심사실패", "no_will_side": "없음", "no_will_reason": "",
