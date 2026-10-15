@@ -19,6 +19,8 @@ import json
 import random
 import time
 import uuid
+import hmac
+import secrets
 import hashlib
 import psycopg2
 from datetime import datetime
@@ -46,19 +48,21 @@ sid_to_user = {}
 user_to_room = {}      # username -> room_id (재접속 시 방을 찾기 위해)
 resume_tokens = {}     # token -> username (재접속 인증용)
 
-# 접속이 끊긴 사람을 기다리는 시간. 이 안에 돌아오면 이어서 진행한다.
-# 끝내 안 돌아와도 몰수패는 아니며, 승패 없이 토론만 종료된다. (몰수패는 항복뿐)
-RECONNECT_GRACE_SECONDS = 180
+# 접속이 끊겨도 토론은 끝나지 않는다. 돌아올 때까지 시계를 멈추고 기다린다.
+# 이 시간이 지나도 안 돌아오면 관리자 화면에 경고를 띄워 운영자가 판단하게 한다.
+# (몰수패는 본인이 직접 누른 항복, 또는 관리자가 승인한 '토론 의지 없음' 판정뿐)
+ABSENT_ALERT_SECONDS = 120
 
 STAGES = ["입론", "반론", "반박", "최종변론"]
 TOTAL_STAGES = len(STAGES)
 TURN_SECONDS = 300              # 기본 발언 시간
-OPENING_SECONDS = 420           # 입론 — 양쪽 모두 7분
+OPENING_SECONDS = 420           # 입론 — 두 사람이 동시에 7분 동안 작성
 MIN_MESSAGE_LENGTH = 30        # 이보다 짧은 발언은 반려한다
 TIMEOUT_MESSAGE = "(시간 초과)"  # 시간 초과 자동 전송은 길이 검사에서 예외
+SERVER_TIMEOUT_GRACE = 6        # 브라우저 자동 전송이 안 오면 서버가 대신 마감하기까지 여유
 
-def turn_limit(stage_index, speaker_idx):
-    """단계별 제한 시간. 입론은 양쪽 다 7분, 나머지는 5분."""
+def turn_limit(stage_index, speaker_idx=None):
+    """단계별 제한 시간. 입론은 7분(동시 작성), 나머지는 5분."""
     return OPENING_SECONDS if stage_index == 0 else TURN_SECONDS
 
 
@@ -72,25 +76,13 @@ JUDGE_CRITERIA = [
 ADMIN_CODE = os.environ.get("DEBATE_ADMIN_CODE", "1234")
 TEST_MODE = "테스트 모드"
 
-# 기본 Gemini 키 (환경변수 GEMINI_API_KEY가 있으면 그쪽이 우선)
-DEFAULT_GEMINI_KEY = "AQ.Ab8RN6LuDcj_jU7-uZHXTq8uQELxQPoh6mrDkzldT3RfG5pPYA"
-
-PROVIDERS = ["gemini", "openai", "anthropic"]
-DEFAULT_MODELS = {
-    "gemini": "gemini-3.7-flash",
-    "openai": "gpt-4o-mini",
-    "anthropic": "claude-haiku-4-5",
-}
-
-# 지원 종료된 모델들. Google이 "모델 없음" 대신 401 인증 오류를 반환해
-# 키 문제처럼 보이게 만들기 때문에, 서버 시작 시 자동으로 최신 모델로 교체한다.
-DEPRECATED_MODELS = {
-    "gemini": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash",
-               "gemini-2.5-pro", "gemini-1.5-pro"],
-}
-
-# 과부하(503)로 막힐 때 순서대로 넘어가며 시도할 모델
-GEMINI_FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+# AI는 ChatGPT(OpenAI) 하나만 쓴다.
+PROVIDER = "openai"
+DEFAULT_MODEL = "gpt-5.4-mini"
+# 지정한 모델이 없다고(404 model_not_found) 나오면 순서대로 시도한다.
+# 모델명이 틀렸을 때 엉뚱한 오류로 헤매지 않도록.
+FALLBACK_MODELS = ["gpt-5.4-mini", "gpt-5-mini", "gpt-4o-mini"]
+DEFAULT_MAX_RPM = 120           # 유료 키 기준. 관리자 화면에서 조정 가능
 
 # AI가 주제를 못 만들 때 쓸 예비 주제. 예전처럼 한 주제만 반복되지 않도록 여러 개를 둔다.
 # 주제는 '~해야 한다' 형태의 긍정 평서문으로 통일한다.
@@ -138,7 +130,7 @@ ALIAS_POOL = [
 # DB 기본 유틸
 # ─────────────────────────────────────────────
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+    return psycopg2.connect(DATABASE_URL, sslmode=os.environ.get("DB_SSLMODE", "require"))
 
 def db_execute(query, params=()):
     conn = get_conn()
@@ -161,6 +153,17 @@ def db_fetchone(query, params=()):
     rows = db_fetchall(query, params)
     return rows[0] if rows else None
 
+def db_execute_returning(query, params=()):
+    """INSERT ... RETURNING 처럼 값을 돌려받으면서 커밋도 해야 하는 경우."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    row = cursor.fetchone()
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return row
+
 
 def init_db():
     db_execute('''CREATE TABLE IF NOT EXISTS users (
@@ -172,6 +175,8 @@ def init_db():
         log_json TEXT, winner TEXT, reason TEXT, engine TEXT)''')
     db_execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS side_a TEXT")
     db_execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS side_b TEXT")
+    # '토론 의지 없음' 판정 대기 / 재심사에 필요한 정보 (AI 원래 판정 등)
+    db_execute("ALTER TABLE debates ADD COLUMN IF NOT EXISTS pending_json TEXT")
     # AI 프로필과 설정을 DB에 저장 → Render 재배포에도 유지됨
     db_execute('''CREATE TABLE IF NOT EXISTS ai_profiles (
         name TEXT PRIMARY KEY, provider TEXT, model TEXT, api_key TEXT)''')
@@ -195,7 +200,8 @@ def set_setting(key, value):
                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
 
 def list_profiles():
-    rows = db_fetchall("SELECT name, provider, model, api_key FROM ai_profiles ORDER BY name")
+    rows = db_fetchall("SELECT name, provider, model, api_key FROM ai_profiles "
+                       "WHERE provider = %s ORDER BY name", (PROVIDER,))
     return [{"name": r[0], "provider": r[1], "model": r[2], "api_key": r[3] or ""} for r in rows]
 
 def upsert_profile(name, provider, model, api_key):
@@ -213,30 +219,27 @@ def get_active_name():
     return get_setting("active_profile", TEST_MODE) or TEST_MODE
 
 def seed_default_profile():
-    """Gemini 프로필 한 개를 보장. 키가 비어 있으면 기본 키로 채움.
-    환경변수 GEMINI_API_KEY가 있으면 그 값을 우선 사용."""
-    seed_key = os.environ.get("GEMINI_API_KEY", "").strip() or DEFAULT_GEMINI_KEY
-    row = db_fetchone("SELECT api_key FROM ai_profiles WHERE name = %s", ("Gemini",))
-    if not row:
-        upsert_profile("Gemini", "gemini", DEFAULT_MODELS["gemini"], seed_key)
-    elif not (row[0] or "").strip():
-        # 프로필은 있는데 키가 비어 있으면 채워줌 (관리자가 넣은 키는 건드리지 않음)
-        db_execute("UPDATE ai_profiles SET api_key = %s WHERE name = %s", (seed_key, "Gemini"))
-    if not get_setting("active_profile"):
-        set_setting("active_profile", "Gemini")
-    migrate_deprecated_models()
-
-
-def migrate_deprecated_models():
-    """지원 종료된 모델을 쓰는 프로필을 최신 기본 모델로 자동 교체."""
-    for provider, old_models in DEPRECATED_MODELS.items():
-        new_model = DEFAULT_MODELS[provider]
-        for old in old_models:
-            rows = db_fetchall("SELECT name FROM ai_profiles WHERE provider = %s AND model = %s",
-                               (provider, old))
-            for (name,) in rows:
-                db_execute("UPDATE ai_profiles SET model = %s WHERE name = %s", (new_model, name))
-                print(f"[모델 자동 교체] {name}: {old} → {new_model}")
+    """
+    ChatGPT 전용으로 정리한다.
+    - 예전 Gemini/Claude 프로필(과 그 키)은 지운다.
+    - 환경변수 OPENAI_API_KEY가 있으면 'ChatGPT' 프로필을 만들어 둔다 (관리자가 넣은 키는 건드리지 않음).
+    - 활성 프로필이 사라졌으면 남은 ChatGPT 프로필로, 없으면 테스트 모드로.
+    """
+    old = db_fetchall("SELECT name FROM ai_profiles WHERE provider <> %s", (PROVIDER,))
+    if old:
+        db_execute("DELETE FROM ai_profiles WHERE provider <> %s", (PROVIDER,))
+        print(f"[정리] ChatGPT 외 프로필 삭제: {[r[0] for r in old]}")
+    env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if env_key:
+        row = db_fetchone("SELECT api_key FROM ai_profiles WHERE name = %s", ("ChatGPT",))
+        if not row:
+            upsert_profile("ChatGPT", PROVIDER, DEFAULT_MODEL, env_key)
+        elif not (row[0] or "").strip():
+            db_execute("UPDATE ai_profiles SET api_key = %s WHERE name = %s", (env_key, "ChatGPT"))
+    names = [p["name"] for p in list_profiles()]
+    active = get_setting("active_profile")
+    if active != TEST_MODE and active not in names:
+        set_setting("active_profile", names[0] if names else TEST_MODE)
 
 def get_active_profile():
     """활성 프로필 반환. 테스트 모드거나 키가 없으면 None."""
@@ -268,12 +271,14 @@ def log_ai_call(kind, ok, error="", ms=0):
         profile = get_active_profile()
     except Exception:
         pass
+    model = (profile or {}).get("model", "-")
+    if profile and _model_redirect.get(model):
+        model = f"{model}→{_model_redirect[model]}"
     try:
         db_execute("INSERT INTO ai_calls (called_at, kind, ok, engine, model, error, ms) "
                    "VALUES (%s,%s,%s,%s,%s,%s,%s)",
                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), kind, ok,
-                    get_active_name(), (profile or {}).get("model", "-"),
-                    (error or "")[:400], int(ms)))
+                    get_active_name(), model, (error or "")[:400], int(ms)))
         # 오래된 기록 정리 (최근 300건만 유지)
         db_execute("DELETE FROM ai_calls WHERE id < "
                    "(SELECT COALESCE(MIN(id),0) FROM (SELECT id FROM ai_calls "
@@ -295,42 +300,50 @@ def ai_call_summary():
                          "ORDER BY id DESC LIMIT 15")
     recent_view = [{"at": r[0], "kind": r[1], "ok": r[2], "model": r[3],
                     "error": r[4] or "", "ms": r[5]} for r in recent]
-    # 한도 초과가 최근에 있었는지
-    quota_hit = any(("429" in (r["error"] or "")) or ("RESOURCE_EXHAUSTED" in (r["error"] or ""))
-                    for r in recent_view)
-    return stats, recent_view, quota_hit
+    billing_hit = any("insufficient_quota" in r["error"] for r in recent_view)
+    rate_hit = any(("429" in r["error"] or "rate_limit" in r["error"]) and
+                   "insufficient_quota" not in r["error"] for r in recent_view)
+    return stats, recent_view, billing_hit, rate_hit
 
 
+# ── 오류 분류 (OpenAI) ─────────────────────────────────────
 def _is_auth_error(e):
     s = str(e)
-    return "401" in s or "UNAUTHENTICATED" in s or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in s
+    return "401" in s or "invalid_api_key" in s or "Incorrect API key" in s
 
 def _is_quota_error(e):
-    """무료 한도 초과(429). 한도는 계정 단위라 모델을 바꿔도 소용없다."""
+    """크레딧/결제 한도 소진. 기다려도 안 풀린다 — 결제 등록이 필요."""
+    return "insufficient_quota" in str(e)
+
+def _is_rate_error(e):
+    """분당 한도 초과(429). 잠깐 기다리면 풀린다."""
     s = str(e)
-    return "429" in s or "RESOURCE_EXHAUSTED" in s or "exceeded your current quota" in s
+    return ("429" in s or "rate_limit" in s) and not _is_quota_error(e)
+
+def _is_model_missing(e):
+    s = str(e)
+    return "model_not_found" in s or ("404" in s and "model" in s.lower()) or "does not exist" in s
 
 def _is_busy_error(e):
-    """모델 과부하(503). 잠시 후 재시도하거나 다른 모델로 넘기면 풀린다."""
-    if _is_quota_error(e):
-        return False
+    """서버 일시 오류. 잠시 후 재시도하면 풀린다."""
     s = str(e)
-    return "503" in s or "UNAVAILABLE" in s or "overloaded" in s.lower()
+    return any(k in s for k in ("500", "502", "503", "overloaded", "server_error",
+                                "Timeout", "timed out", "APIConnectionError"))
 
-def _retry_after_seconds(e, default=30):
-    """'Please retry in 30.15s' 같은 안내에서 대기 시간을 뽑아낸다."""
+def _retry_after_seconds(e, default=5):
+    """'Please try again in 1.5s' / '...in 300ms' 같은 안내에서 대기 시간을 뽑아낸다."""
     import re as _re
-    m = _re.search(r"retry in ([0-9.]+)s", str(e))
+    s = str(e)
+    m = _re.search(r"try again in ([0-9.]+)\s*ms", s)
     if m:
-        try:
-            return min(float(m.group(1)) + 1, 90)
-        except ValueError:
-            pass
+        return min(float(m.group(1)) / 1000 + 0.5, 60)
+    m = _re.search(r"try again in ([0-9.]+)\s*s", s)
+    if m:
+        return min(float(m.group(1)) + 0.5, 60)
     return default
 
 
 # ── 분당 호출량 제한 ───────────────────────────────────────
-# 무료 한도(분당 20회)에 닿기 전에 우리가 먼저 조절한다.
 from collections import deque
 _call_times = deque()
 
@@ -342,13 +355,13 @@ def current_rpm():
 
 def max_rpm():
     try:
-        return int(get_setting("ai_max_rpm", "15") or 15)
+        return int(get_setting("ai_max_rpm_v2", str(DEFAULT_MAX_RPM)) or DEFAULT_MAX_RPM)
     except (TypeError, ValueError):
-        return 15
+        return DEFAULT_MAX_RPM
 
 def rate_gate(priority="high", max_wait=70):
     """
-    호출 허가. 낮은 우선순위(요약)는 붐비면 즉시 포기한다.
+    호출 허가. 낮은 우선순위(요약·주제 창고)는 붐비면 즉시 포기한다.
     높은 우선순위도 무한정 기다리지 않는다 — 최대 max_wait초.
     """
     limit = max_rpm()
@@ -367,166 +380,178 @@ def _pause(seconds):
     try:
         socketio.sleep(seconds)
     except Exception:
-        import time
         time.sleep(seconds)
 
 
-def _gemini_once(api_key, model, prompt):
-    """API 버전을 순차 시도. 인증 오류일 때만 다음 버전으로 넘어간다."""
-    from google import genai
-    from google.genai import types as genai_types
-    last_err = None
-    for api_version in (None, "v1", "v1alpha"):
-        kwargs = {"api_key": api_key}
-        if api_version:
-            kwargs["http_options"] = genai_types.HttpOptions(api_version=api_version)
-        try:
-            client = genai.Client(**kwargs)
-            return client.models.generate_content(model=model, contents=prompt).text.strip()
-        except Exception as e:
-            last_err = e
-            if not _is_auth_error(e):
-                raise
-    raise last_err
-
-
-def _gemini_call(api_key, model, prompt):
-    """
-    과부하(503)일 때만 재시도·모델 전환을 한다.
-    한도 초과(429)는 즉시 포기한다 — 무료 한도는 계정 전체가 공유하므로
-    모델을 바꿔가며 재시도하면 남은 한도만 더 빨리 태운다.
-    """
-    candidates = [model] + [m for m in GEMINI_FALLBACK_MODELS if m != model]
-    last_err = None
-    first = True
-    for idx, candidate in enumerate(candidates):
-        for attempt in range(2):
-            if not first:
-                _call_times.append(time.time())   # 재시도도 한도에 포함시킨다
-            first = False
-            try:
-                return _gemini_once(api_key, candidate, prompt)
-            except Exception as e:
-                last_err = e
-                if _is_quota_error(e):
-                    raise QuotaExceeded(str(e), _retry_after_seconds(e))
-                if _is_busy_error(e) and attempt == 0:
-                    print(f"[Gemini 과부하] {candidate} 1회 재시도")
-                    _pause(1.5)
-                    continue
-                break
-        if not _is_busy_error(last_err):
-            break   # 과부하가 아니면 다른 모델을 시도해봐야 의미 없다
-    raise last_err
-
-
 class QuotaExceeded(Exception):
-    """무료 한도 초과. 재시도나 모델 전환으로 풀리지 않는다."""
+    """한도 초과. retry_after>0이면 잠시 후 재시도로 풀릴 수 있다."""
     def __init__(self, message, retry_after=0):
         super().__init__(message)
         self.retry_after = retry_after
 
 
-def call_one_profile(profile, prompt, max_tokens):
-    """프로필 하나로 실제 호출."""
-    provider = profile["provider"]
-    if provider == "openai":
-        from openai import OpenAI
-        c = OpenAI(api_key=profile["api_key"])
-        r = c.chat.completions.create(model=profile["model"],
-                                      messages=[{"role": "user", "content": prompt}])
-        return r.choices[0].message.content.strip()
-    elif provider == "anthropic":
-        from anthropic import Anthropic
-        c = Anthropic(api_key=profile["api_key"])
-        r = c.messages.create(model=profile["model"], max_tokens=max_tokens,
-                              messages=[{"role": "user", "content": prompt}])
-        return r.content[0].text.strip()
-    elif provider == "gemini":
-        return _gemini_call(profile["api_key"], profile["model"], prompt)
-    raise RuntimeError(f"지원하지 않는 제공사: {provider}")
+# 모델마다 지원하지 않는 옵션 (예: gpt-4o-mini는 reasoning_effort를 모른다) — 한 번 겪으면 기억
+_unsupported_params = {}
+# 지정 모델이 없을 때 실제로 쓰게 된 모델
+_model_redirect = {}
+
+
+def _openai_once(api_key, model, prompt, json_schema=None, effort="low"):
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key, timeout=90, max_retries=0)
+    drop = _unsupported_params.setdefault(model, set())
+    for _ in range(3):
+        kwargs = {"model": model, "messages": [{"role": "user", "content": prompt}]}
+        if effort and "reasoning_effort" not in drop:
+            kwargs["reasoning_effort"] = effort
+        if json_schema and "response_format" not in drop:
+            kwargs["response_format"] = {"type": "json_schema", "json_schema": json_schema}
+        try:
+            r = client.chat.completions.create(**kwargs)
+            return (r.choices[0].message.content or "").strip()
+        except Exception as e:
+            s = str(e)
+            if "400" in s or "BadRequest" in type(e).__name__:
+                if "reasoning_effort" in kwargs and "reasoning" in s.lower():
+                    drop.add("reasoning_effort")
+                    continue
+                if "response_format" in kwargs and ("response_format" in s or "json_schema" in s):
+                    drop.add("response_format")
+                    continue
+            raise
+    raise RuntimeError("요청 옵션을 맞추지 못했습니다.")
+
+
+def _openai_call(api_key, model, prompt, json_schema=None):
+    """
+    - 모델이 없으면(404) 예비 모델로 넘어가고, 다음부터는 바로 그 모델을 쓴다.
+    - 서버 일시 오류는 1회 재시도.
+    - 한도 초과는 QuotaExceeded로 올려서 호출한 쪽이 기다릴지 결정하게 한다.
+    """
+    start = _model_redirect.get(model, model)
+    candidates = [start] + [m for m in FALLBACK_MODELS if m != start]
+    last_err = None
+    first = True
+    for cand in candidates:
+        for attempt in range(2):
+            if not first:
+                _call_times.append(time.time())   # 재시도도 한도에 포함
+            first = False
+            try:
+                out = _openai_once(api_key, cand, prompt, json_schema)
+                if cand != model:
+                    if _model_redirect.get(model) != cand:
+                        print(f"[모델 대체] {model} 없음 → {cand}")
+                    _model_redirect[model] = cand
+                return out
+            except Exception as e:
+                last_err = e
+                if _is_quota_error(e):
+                    raise QuotaExceeded(str(e), 0)
+                if _is_rate_error(e):
+                    raise QuotaExceeded(str(e), _retry_after_seconds(e, 5))
+                if _is_busy_error(e) and attempt == 0:
+                    _pause(1.5)
+                    continue
+                break
+        if not _is_model_missing(last_err):
+            break
+    raise last_err
+
+
+def call_one_profile(profile, prompt, json_schema=None):
+    return _openai_call(profile["api_key"], profile["model"], prompt, json_schema)
 
 
 def backup_profiles():
-    """활성 프로필이 한도에 걸렸을 때 대신 쓸 프로필들 (키가 등록된 것만)."""
+    """활성 키가 크레딧 소진·한도에 걸렸을 때 대신 쓸 키들 (등록된 것만)."""
     active = get_active_name()
     return [p for p in list_profiles()
             if p["name"] != active and (p.get("api_key") or "").strip()]
 
 
-def llm_call(prompt, max_tokens=600, raise_errors=False, priority="high"):
+def llm_call(prompt, max_tokens=None, raise_errors=False, priority="high", json_schema=None):
     """
     priority='high'  — 심사·주제. 자리가 날 때까지 기다린다.
-    priority='low'   — 발언 요약. 한도가 빠듯하면 건너뛴다.
+    priority='low'   — 발언 요약·주제 창고. 한도가 빠듯하면 건너뛴다.
     """
     profile = get_active_profile()
     if not profile:
         if raise_errors:
-            raise RuntimeError("활성 프로필이 없거나 API 키가 비어 있습니다.")
+            raise RuntimeError("활성 AI가 없거나 API 키가 비어 있습니다. (테스트 모드)")
         return None
 
     if not rate_gate(priority):
-        msg = "분당 호출 한도에 근접해 이번 요약은 건너뜁니다."
+        msg = "분당 호출 상한에 걸려 이번 요청은 건너뜁니다."
         if raise_errors:
-            raise QuotaExceeded(msg)
+            raise QuotaExceeded(msg, 5)
         return None
 
     try:
-        return call_one_profile(profile, prompt, max_tokens)
+        return call_one_profile(profile, prompt, json_schema)
     except QuotaExceeded as quota_err:
-        # 한도 초과 — 같은 키로 재시도해봐야 소용없다. 다른 키가 있으면 그쪽으로.
         for backup in backup_profiles():
             if not rate_gate("high"):
                 break
             try:
-                result = call_one_profile(backup, prompt, max_tokens)
-                print(f"[키 전환] {profile['name']} 한도 초과 → {backup['name']}로 처리")
+                result = call_one_profile(backup, prompt, json_schema)
+                print(f"[키 전환] {profile['name']} 한도 → {backup['name']}로 처리")
                 return result
-            except QuotaExceeded:
-                continue
             except Exception:
                 continue
-        print(f"[LLM 한도 초과] 사용 가능한 키가 없습니다: {quota_err}")
-        if raise_errors:
-            raise
-        return None
-    except ImportError as e:
-        print(f"[LLM 오류] {profile['provider']} SDK 미설치: {e}")
+        print(f"[LLM 한도] {quota_err}")
         if raise_errors:
             raise
         return None
     except Exception as e:
-        print(f"[LLM 호출 실패] {profile['provider']}: {e}")
+        print(f"[LLM 호출 실패] {type(e).__name__}: {e}")
         if raise_errors:
             raise
         return None
 
 
-def _sdk_version(provider):
-    pkg = {"gemini": "google-genai", "openai": "openai", "anthropic": "anthropic"}.get(provider)
-    if not pkg:
-        return "?"
+def _sdk_version():
     try:
         import importlib.metadata as md
-        return md.version(pkg)
+        return md.version("openai")
     except Exception:
         return "미설치"
+
+
+def explain_ai_error(e):
+    """관리자가 바로 조치할 수 있게 원인을 한국어로 풀어준다."""
+    if _is_quota_error(e):
+        return "크레딧/결제 한도 소진(insufficient_quota) — platform.openai.com에서 결제 수단·크레딧을 확인하세요."
+    if _is_rate_error(e):
+        return "분당 사용량 한도 초과(429) — 잠시 후 자동으로 풀립니다."
+    if _is_auth_error(e):
+        return "API 키가 잘못됐습니다(401) — 키를 다시 복사해 등록하세요."
+    if _is_model_missing(e):
+        return "모델명을 찾을 수 없습니다(404) — 모델명을 확인하세요."
+    return ""
 
 
 def test_llm_connection():
     """관리자 페이지의 '연결 테스트' 버튼용. 실패 원인을 화면에 그대로 표시."""
     profile = get_active_profile()
     if not profile:
-        return False, "활성 프로필이 없거나 API 키가 비어 있습니다."
-    info = (f"프로필 {profile['name']} | {profile['provider']} / {profile['model']} | "
-            f"SDK {_sdk_version(profile['provider'])} | 키 {mask_key(profile['api_key'])}")
+        return False, "활성 AI가 없거나 API 키가 비어 있습니다. (테스트 모드)"
+    info = (f"{profile['name']} | {profile['model']} | SDK openai {_sdk_version()} | "
+            f"키 {mask_key(profile['api_key'])}")
     try:
-        result = llm_call("'연결 성공'이라고만 답해.", max_tokens=50, raise_errors=True)
+        # 예비 키로 넘어가지 않고 '선택한 키' 하나만 시험한다
+        _call_times.append(time.time())
+        result = call_one_profile(profile, "'연결 성공'이라고만 답해.")
+        note = ""
+        if _model_redirect.get(profile["model"]):
+            note = (f"\n⚠️ '{profile['model']}' 모델이 없어 '{_model_redirect[profile['model']]}'로 "
+                    f"대신 처리했습니다. 모델명을 고쳐두세요.")
         if result:
-            return True, f"{info}\n응답: {result[:80]}"
+            return True, f"{info}\n응답: {result[:80]}{note}"
         return False, f"{info}\n예외 없이 빈 응답이 돌아왔습니다."
     except Exception as e:
-        return False, f"{info}\n{type(e).__name__}: {str(e)[:500]}"
+        hint = explain_ai_error(e)
+        return False, f"{info}\n{('→ ' + hint + chr(10)) if hint else ''}{type(e).__name__}: {str(e)[:400]}"
 
 
 # ─────────────────────────────────────────────
@@ -549,13 +574,16 @@ def record_win_loss(winner, loser):
     db_execute("UPDATE users SET wins = wins + 1, points = points + 20 WHERE username = %s", (winner,))
     db_execute("UPDATE users SET losses = losses + 1, points = points - 15 WHERE username = %s", (loser,))
 
-def save_debate(topic, player_a, player_b, side_a, side_b, logs, winner, reason):
+def save_debate(topic, player_a, player_b, side_a, side_b, logs, winner, reason, pending=None):
+    """토론 기록 저장. 새 기록의 id를 돌려준다 (판정 대기·재심사에서 다시 찾기 위해)."""
     engine = get_active_name()
-    db_execute(
-        "INSERT INTO debates (played_at, topic, player_a, player_b, side_a, side_b, log_json, winner, reason, engine) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+    row = db_execute_returning(
+        "INSERT INTO debates (played_at, topic, player_a, player_b, side_a, side_b, log_json, "
+        "winner, reason, engine, pending_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (datetime.now().strftime("%Y-%m-%d %H:%M"), topic, player_a, player_b, side_a, side_b,
-         json.dumps(logs, ensure_ascii=False), winner, reason, engine))
+         json.dumps(logs, ensure_ascii=False), winner, reason, engine,
+         json.dumps(pending, ensure_ascii=False) if pending else None))
+    return row[0] if row else None
 
 
 init_db()
@@ -722,62 +750,117 @@ def get_ai_summary(text):
         log_ai_call("발언요약", False, f"{type(e).__name__}: {e}", (time.time() - started) * 1000)
         return None
 
+def draws_allowed():
+    return get_setting("allow_draw", "0") == "1"
+
+
+def _judge_schema(allow_draw):
+    winners = ["찬성", "반대"] + (["무승부"] if allow_draw else [])
+    return {
+        "name": "debate_verdict",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["winner", "score_pro", "score_con", "reason", "no_will_side", "no_will_reason"],
+            "properties": {
+                "winner": {"type": "string", "enum": winners},
+                "score_pro": {"type": "integer"},
+                "score_con": {"type": "integer"},
+                "reason": {"type": "string"},
+                "no_will_side": {"type": "string", "enum": ["없음", "찬성", "반대", "둘다"]},
+                "no_will_reason": {"type": "string"},
+            },
+        },
+    }
+
+
 def judge_debate(topic, logs):
+    """
+    반환: {"ok": bool, "winner": 찬성/반대/무승부, "text": 결과 문구,
+           "no_will_side": 없음/찬성/반대/둘다, "no_will_reason": str}
+    실패하면 ok=False, winner='심사실패'.
+    """
+    allow_draw = draws_allowed()
     log_text = "\n".join([f"[{log['stage']}] {log['side']}: {log['text']}" for log in logs])
+    draw_rule = ("- 실력이 정말 대등할 때만 '무승부'를 줄 수 있다."
+                 if allow_draw else
+                 "- 이 대회는 토너먼트라 무승부가 없다. 점수가 같더라도 조금이라도 나은 쪽을 반드시 승자로 정하라.")
     prompt = f"""너는 고등학교 토론 동아리의 심사위원이다. 아래 1대1 찬반 토론을 단계별 심사 기준에 따라 엄격히 평가하라.
 
 [심사 기준 — 단계당 5점 만점, 총 20점]
-1. 입론: 논지의 명확성과 근거의 타당성
+1. 입론: 논지의 명확성과 근거의 타당성 (입론은 두 사람이 서로의 글을 보지 않고 동시에 작성했다)
 2. 반론: 상대 논리의 허점을 정확히 짚어내는 능력
 3. 반박: 반론에 대한 재반박의 논리성
 4. 최종변론: 전체 논지 정리와 설득력
+- '(시간 초과)'로 적힌 발언은 그 단계 0점이다.
+{draw_rule}
+
+[토론 의지 없음 판정 — 매우 보수적으로]
+다음에 해당할 때만 그 측을 no_will_side로 지목하라.
+- 주제와 전혀 관계없는 내용(잡담, 장난, 욕설, 다른 주제 이야기)을 반복했다
+- 의미 없는 글자·같은 문장 반복 등으로 글자 수만 채웠다
+- 자기 진영과 반대되는 주장을 일부러 펼쳐 토론을 망쳤다
+다음은 절대 해당하지 않는다: 논리가 약함, 근거가 부족함, 엉뚱하거나 서툰 주장, 맞춤법 실수,
+짧지만 주제에 대해 성실히 쓴 발언, 시간 초과가 몇 번 있었던 경우.
+조금이라도 애매하면 '없음'으로 하라. 해당하면 no_will_reason에 구체적인 발언을 근거로 한 문장으로 쓰고,
+해당하지 않으면 no_will_reason은 빈 문자열로 둔다.
 
 [주제] {topic}
 [토론 로그 — 단계 순서대로]
 {log_text}
 
 반드시 아래 JSON 형식으로만 답하라.
-{{"winner": "찬성" 또는 "반대" 또는 "무승부", "score_pro": 총점숫자, "score_con": 총점숫자, "reason": "단계별 근거를 포함해 4문장 이내로"}}"""
-    # 심사는 토론의 결론이므로 조용히 무승부로 넘기지 않고 여러 번 시도한다
+{{"winner": "찬성" 또는 "반대"{' 또는 "무승부"' if allow_draw else ''}, "score_pro": 총점숫자, "score_con": 총점숫자,
+ "reason": "단계별 근거를 포함해 4문장 이내로", "no_will_side": "없음"/"찬성"/"반대"/"둘다", "no_will_reason": ""}}"""
+    schema = _judge_schema(allow_draw)
     last_error = ""
     for attempt in range(3):
         started = time.time()
         try:
-            raw = llm_call(prompt, max_tokens=900, raise_errors=True)
+            raw = llm_call(prompt, raise_errors=True, json_schema=schema)
             data = json.loads(raw.replace("```json", "").replace("```", "").strip())
-            winner = data.get("winner", "무승부")
-            if winner not in ("찬성", "반대", "무승부"):
+            winner = data.get("winner", "")
+            valid = ("찬성", "반대", "무승부") if allow_draw else ("찬성", "반대")
+            if winner not in valid:
                 raise ValueError(f"알 수 없는 판정값: {winner}")
+            no_will = data.get("no_will_side", "없음")
+            if no_will not in ("없음", "찬성", "반대", "둘다"):
+                no_will = "없음"
             log_ai_call("심사", True, "", (time.time() - started) * 1000)
             verdict_line = f"판정: {winner}측 승리" if winner != "무승부" else "판정: 무승부"
-            result_text = (verdict_line + "\n" +
-                           f"점수: 찬성 {data.get('score_pro','?')}점 vs 반대 {data.get('score_con','?')}점 (20점 만점)\n" +
-                           f"근거: {data.get('reason','근거 없음')}")
-            return winner, result_text
+            text = (verdict_line + "\n" +
+                    f"점수: 찬성 {data.get('score_pro','?')}점 vs 반대 {data.get('score_con','?')}점 (20점 만점)\n" +
+                    f"근거: {data.get('reason','근거 없음')}")
+            return {"ok": True, "winner": winner, "text": text,
+                    "no_will_side": no_will, "no_will_reason": data.get("no_will_reason", "")}
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
             log_ai_call("심사", False, last_error, (time.time() - started) * 1000)
+            if isinstance(e, QuotaExceeded) and not e.retry_after:
+                break   # 크레딧 소진은 기다려도 안 풀린다
             if attempt < 2:
-                # 한도 초과면 서버가 알려준 시간만큼 기다린다 (보통 30초 안팎)
-                wait = _retry_after_seconds(e, 0) if _is_quota_error(e) else 2 * (attempt + 1)
-                if wait:
-                    print(f"[심사 재시도] {wait:.0f}초 대기")
-                _pause(wait or 2 * (attempt + 1))
+                wait = e.retry_after if isinstance(e, QuotaExceeded) else 2 * (attempt + 1)
+                print(f"[심사 재시도] {wait:.0f}초 대기")
+                _pause(max(wait, 1))
 
-    # 세 번 다 실패 — 무승부로 위장하지 않고 심사 실패로 남긴다 (전적에 반영하지 않음)
-    return "심사실패", ("⚠️ AI 심사에 실패했습니다.\n"
-                        "승패는 기록되지 않았으며, 운영자가 확인 후 다시 심사할 수 있습니다.\n"
-                        f"원인: {last_error[:200]}")
+    hint = explain_ai_error(Exception(last_error))
+    return {"ok": False, "winner": "심사실패", "no_will_side": "없음", "no_will_reason": "",
+            "text": ("⚠️ AI 심사에 실패했습니다.\n"
+                     "승패는 아직 기록되지 않았으며, 운영자가 관리자 화면에서 다시 심사할 수 있습니다.\n"
+                     f"원인: {hint or last_error[:200]}")}
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>동아리 익명 1대1 토론 리그</title>
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <style>
 body{font-family:'Malgun Gothic',sans-serif;max-width:600px;margin:30px auto;padding:20px;background:#f3f4f6;}
+#turn-status{white-space:pre-line;}
 .box{border:1px solid #e5e7eb;padding:20px;background:white;margin-bottom:15px;border-radius:12px;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);}
 #chat-box{height:320px;overflow-y:auto;border:1px solid #e5e7eb;padding:15px;background:#f9fafb;margin-bottom:15px;border-radius:8px;}
 .hidden{display:none;} .turn-active{background-color:#eff6ff;border:2px solid #3b82f6;}
@@ -859,7 +942,7 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
   <p style="font-size:0.9em;color:#555;">✅ 끝까지 완주하면 승패와 관계없이 <b>+5점</b>!</p>
   <button onclick="joinQueue()" id="match-btn" style="padding:10px 20px;cursor:pointer;background:#2563eb;color:white;border:none;border-radius:6px;font-weight:bold;">토론 매칭 시작</button>
   <p id="queue-text" style="color:#2563eb;font-weight:bold;margin-top:10px;"></p>
-  <p class="nav"><a href="/ranking">🏆 랭킹 보기</a> · <a href="/history">📚 토론 기록</a></p>
+  <p class="nav"><a href="/ranking">🏆 랭킹 보기</a> · <a href="/history">📚 토론 기록</a> · <a href="#" onclick="logout();return false;">로그아웃</a></p>
 </div>
 <div id="debate-area" class="box hidden">
   <div id="stage-dots"></div>
@@ -876,7 +959,7 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
   <details id="surrender-wrap">
     <summary>기타</summary>
     <p class="warn">항복하면 <b>패배로 기록</b>되고 토론이 즉시 끝납니다.<br>
-    (창을 닫거나 연결이 끊기는 것만으로는 패배하지 않습니다)</p>
+    (창을 닫거나 연결이 끊겨도 패배하지 않습니다 — 다시 접속하면 이어서 진행)</p>
     <button id="surrender-btn" onclick="surrender()">🏳️ 항복하기</button>
   </details>
 </div>
@@ -903,32 +986,57 @@ document.addEventListener('keydown',e=>{
 });
 const socket=io({reconnection:true,reconnectionAttempts:Infinity,
   reconnectionDelay:800,reconnectionDelayMax:4000,timeout:20000});
-let currentRoom="",myTurn=false,totalStages=4,resumeToken="",oppGone=false;
+let currentRoom="",myTurn=false,totalStages=4,oppGone=false,judging=false;
+// 입론은 두 사람이 동시에 작성한다
+let opening=false,myOpeningDone=false,oppOpeningDone=false;
+let wantQueue=false,kicked=false;
 const TIMER_SECONDS={{ turn_seconds }};
-let timerInterval=null,remaining=TIMER_SECONDS,minLength={{ min_length }};
+let timerInterval=null,remaining=TIMER_SECONDS,deadlineAt=0,minLength={{ min_length }};
 let speakerAlias="",speakerSide="";
-// 타이머는 내 차례든 상대 차례든 항상 돈다. 시간이 다 되면 발언자만 자동 전송한다.
+// 새로고침해도 이어지도록 접속 토큰과 작성 중인 초안을 브라우저에 보관한다
+function store(k,v){try{if(v===null)localStorage.removeItem(k);else localStorage.setItem(k,v);}catch(e){}}
+function load(k){try{return localStorage.getItem(k);}catch(e){return null;}}
+let resumeToken=load('debate_token')||"";
+function draftKey(){return 'debate_draft_'+currentRoom;}
+function saveDraft(){if(currentRoom)store(draftKey(),document.getElementById('msg-input').value);}
+function restoreDraft(){const el=document.getElementById('msg-input');const v=load(draftKey());
+  if(v&&!el.value.trim())el.value=v;updateLenHint();}
+function clearDrafts(){try{Object.keys(localStorage).filter(k=>k.startsWith('debate_draft_')).forEach(k=>localStorage.removeItem(k));}catch(e){}}
+
+function canSend(){return !oppGone&&!judging&&(opening?!myOpeningDone:myTurn);}
+// 타이머는 마감 시각 기준 — 휴대폰 화면이 꺼졌다 켜져도 정확하다
 function startTimer(seconds){clearInterval(timerInterval);
-  remaining=(typeof seconds==='number'&&seconds>=0)?seconds:TIMER_SECONDS;updateTimerText();
-  timerInterval=setInterval(()=>{remaining--;updateTimerText();
-    if(remaining<=0){clearInterval(timerInterval);if(myTurn)autoSend();}},1000);}
+  const s=(typeof seconds==='number'&&seconds>=0)?seconds:TIMER_SECONDS;
+  deadlineAt=Date.now()+s*1000;tick();timerInterval=setInterval(tick,500);}
+function tick(){remaining=Math.max(0,Math.ceil((deadlineAt-Date.now())/1000));updateTimerText();
+  if(remaining<=0){clearInterval(timerInterval);if(canSend())autoSend();}}
 function stopTimer(){clearInterval(timerInterval);}
 function clockText(){const r=Math.max(0,remaining),m=Math.floor(r/60),s=String(r%60).padStart(2,'0');
   return m+":"+s;}
 function updateTimerText(){const el=document.getElementById('turn-status');
-  if(oppGone){return;}
-  el.classList.toggle('urgent', myTurn && remaining<=30);
-  if(myTurn){el.classList.remove('waiting');
-    el.innerText=(remaining<=30?"🚨":"⏰")+" 당신의 발언 차례입니다! (남은 시간 "+clockText()+")";}
-  else{el.classList.add('waiting');
-    el.innerText="⏳ 상대방 발언 중 — 남은 시간 "+clockText()+" · 미리 작성해두세요";}}
+  if(oppGone||judging){return;}
+  const mine=canSend();
+  el.classList.toggle('urgent', mine && remaining<=30);
+  el.classList.toggle('waiting', !mine);
+  if(opening){
+    if(!myOpeningDone){
+      el.innerText=(remaining<=30?"🚨":"✍️")+" 입론 작성 시간 — 남은 시간 "+clockText()+
+        "\\n두 사람이 동시에 씁니다. 상대 입론은 둘 다 제출하면 함께 공개됩니다."+
+        (oppOpeningDone?"\\n(상대는 제출을 마쳤습니다 — 서두를 필요 없이 남은 시간을 다 써도 됩니다)":"");
+    }else{
+      el.innerText="✅ 입론 제출 완료 — 상대가 입론을 마칠 때까지 기다리는 중 (남은 시간 "+clockText()+")\\n다음 단계 발언을 미리 적어둘 수 있습니다.";
+    }
+    return;}
+  if(myTurn){el.innerText=(remaining<=30?"🚨":"⏰")+" 당신의 발언 차례입니다! (남은 시간 "+clockText()+")";}
+  else{el.innerText="⏳ 상대방 발언 중 — 남은 시간 "+clockText()+" · 미리 작성해두세요";}}
 function autoSend(){const i=document.getElementById('msg-input');
   if(i.value.trim().length<minLength)i.value="(시간 초과)";sendMessage(true);}
 function renderCriteria(list){
   if(!list||!list.length)return;
   const box=document.getElementById('criteria-box');
   box.innerHTML='<b>📋 AI 심사 기준</b> — 단계당 5점, 총 20점<br>'+
-    list.map(c=>"<span class='ct'>"+c.stage+"</span> "+c.desc).join('<br>');}
+    list.map(c=>"<span class='ct'>"+c.stage+"</span> "+c.desc).join('<br>')+
+    '<br><span style="color:#9ca3af;">※ 주제와 무관한 내용·장난으로 일관하면 운영자 확인 후 몰수패가 될 수 있습니다.</span>';}
 function updateLenHint(){const v=document.getElementById('msg-input').value.trim();
   const el=document.getElementById('len-hint');
   el.textContent=v.length+"자 / 최소 "+minLength+"자";
@@ -939,12 +1047,15 @@ function surrender(){
   socket.emit('surrender',{});}
 function login(){const n=document.getElementById('username').value,p=document.getElementById('pin').value;
   if(!n.trim()||!p.trim())return alert('아이디와 PIN을 입력해주세요.');socket.emit('login',{username:n,pin:p});}
+function logout(){store('debate_token',null);clearDrafts();location.reload();}
 socket.on('login_ok',d=>{
-  resumeToken=d.resume_token||"";
+  resumeToken=d.resume_token||"";store('debate_token',resumeToken);
   document.getElementById('login-area').classList.add('hidden');
-  document.getElementById('profile-area').classList.remove('hidden');
+  if(!currentRoom)document.getElementById('profile-area').classList.remove('hidden');
   document.getElementById('my-name').textContent=d.username;
-  document.getElementById('my-stats').textContent="내 전적: "+d.wins+"승 "+d.losses+"패 | 점수: "+d.points+"점 | 현재 "+d.rank+"위";});
+  document.getElementById('my-stats').textContent="내 전적: "+d.wins+"승 "+d.losses+"패 | 점수: "+d.points+"점 | 현재 "+d.rank+"위";
+  // 대기실에 있다가 연결이 잠깐 끊겼으면 다시 줄을 선다
+  if(wantQueue&&!currentRoom)socket.emit('join_queue',{});});
 
 function setNetBanner(text,color){
   let el=document.getElementById('net-banner');
@@ -955,15 +1066,20 @@ function setNetBanner(text,color){
   if(!text){el.remove();return;}
   el.textContent=text;el.style.background=color;}
 
-socket.on('disconnect',()=>{stopTimer();
-  setNetBanner('⚠️ 연결이 끊겼습니다. 다시 연결하는 중...','#dc2626');});
+socket.on('disconnect',()=>{if(kicked)return;stopTimer();
+  setNetBanner('⚠️ 연결이 끊겼습니다. 자동으로 다시 연결하는 중... (작성 중인 내용은 그대로 있습니다)','#dc2626');});
 socket.on('connect',()=>{
-  if(resumeToken&&currentRoom){socket.emit('resume',{token:resumeToken});}
+  if(kicked)return;
+  if(resumeToken){socket.emit('resume',{token:resumeToken});}
   else{setNetBanner('','');}});
+socket.on('kicked',()=>{kicked=true;stopTimer();socket.disconnect();
+  setNetBanner('같은 아이디로 다른 곳에서 접속해 이 화면은 연결을 끊었습니다.','#6b7280');
+  document.getElementById('send-btn').disabled=true;});
 socket.on('resumed',d=>{
-  setNetBanner('✅ 다시 연결되었습니다','#16a34a');
+  setNetBanner('✅ 다시 연결되었습니다 — 이어서 진행합니다','#16a34a');
   setTimeout(()=>setNetBanner('',''),2500);
   currentRoom=d.room_id;totalStages=d.total_stages;myTurn=d.your_turn;
+  opening=d.opening;myOpeningDone=d.my_opening_done;oppOpeningDone=d.opp_opening_done;judging=d.judging;
   document.getElementById('login-area').classList.add('hidden');
   document.getElementById('profile-area').classList.add('hidden');
   document.getElementById('debate-area').classList.remove('hidden');
@@ -977,27 +1093,31 @@ socket.on('resumed',d=>{
   d.logs.forEach(l=>appendMessage(cb,l,false));
   cb.scrollTop=cb.scrollHeight;
   showStage(d.stage,d.stage_index,d.total_stages,false);
-  oppGone=false;updateTurnUI(d.seconds_left);});
+  restoreDraft();
+  if(judging){showJudging('AI가 토론을 심사하고 있습니다...');return;}
+  oppGone=!d.opp_connected;
+  if(oppGone)showOppGone();
+  updateTurnUI(d.seconds_left);});
 socket.on('resume_failed',()=>{setNetBanner('','');
-  if(currentRoom){alert('토론이 이미 종료되었습니다.');location.reload();}});
-socket.on('opponent_disconnected',d=>{oppGone=true;stopTimer();
-  setNetBanner('⏳ 상대방 연결이 끊겼습니다. 기다리는 중... ('+Math.round(d.seconds/60)+
-    '분 안에 안 돌아오면 승패 없이 종료됩니다)','#d97706');});
-socket.on('debate_aborted',d=>{stopTimer();
-  alert("⏹️ 토론이 중단되었습니다.\\n\\n"+d.headline+
-        "\\n승패는 기록되지 않았습니다.\\n\\n"+d.reveal);location.reload();});
-socket.on('opponent_reconnected',()=>{oppGone=false;
-  setNetBanner('✅ 상대방이 돌아왔습니다','#16a34a');
+  store('debate_token',null);resumeToken="";
+  if(currentRoom){alert('토론이 이미 종료되었습니다. 다시 로그인해주세요.');location.reload();}});
+function showOppGone(){stopTimer();
+  setNetBanner('⏸ 상대방 연결이 끊겼습니다. 돌아올 때까지 시계가 멈춥니다.','#d97706');
+  const el=document.getElementById('turn-status');el.classList.add('waiting');
+  el.innerText="⏸ 상대 재접속 대기 중 (시계 정지) — 계속 작성해도 됩니다";
+  document.getElementById('send-btn').disabled=true;}
+socket.on('opponent_disconnected',()=>{oppGone=true;showOppGone();});
+socket.on('debate_aborted',d=>{stopTimer();clearDrafts();
+  alert("⏹️ 토론이 중단되었습니다.\\n\\n"+d.headline+"\\n\\n"+d.reveal);location.reload();});
+socket.on('opponent_reconnected',d=>{oppGone=false;
+  setNetBanner('✅ 상대방이 돌아왔습니다 — 시계가 다시 갑니다','#16a34a');
   setTimeout(()=>setNetBanner('',''),2500);
-  updateTurnUI(remaining);});
+  updateTurnUI(d&&typeof d.seconds_left==='number'?d.seconds_left:remaining);});
 socket.on('error_msg',d=>alert(d.msg));
-function joinQueue(){socket.emit('join_queue',{});document.getElementById('match-btn').disabled=true;}
+function joinQueue(){wantQueue=true;socket.emit('join_queue',{});document.getElementById('match-btn').disabled=true;}
 socket.on('status',d=>{document.getElementById('queue-text').innerText=d.msg;});
-// 매칭이 실패해 대기열로 돌아갔을 때 자동으로 다시 시도
-socket.on('rejoin_queue',()=>{setTimeout(()=>{
-  if(!currentRoom)socket.emit('join_queue',{});},3000);});
 // 매칭 버튼이 눌린 채 잠기지 않도록, 방이 안 생겼으면 다시 누를 수 있게 풀어준다
-socket.on('error_msg',()=>{if(!currentRoom){
+socket.on('error_msg',()=>{if(!currentRoom&&!wantQueue){
   const b=document.getElementById('match-btn');if(b)b.disabled=false;}});
 function renderStageDots(idx,total){
   const wrap=document.getElementById('stage-dots');wrap.innerHTML='';
@@ -1005,7 +1125,7 @@ function renderStageDots(idx,total){
     dot.className='dot'+(i<idx?' done':i===idx?' current':'');wrap.appendChild(dot);}}
 function showStage(stageName,idx,total,animate){
   const banner=document.getElementById('stage-banner');
-  banner.textContent='📍 현재 단계: '+stageName+' ('+(idx+1)+'/'+total+')';
+  banner.textContent='📍 현재 단계: '+stageName+(idx===0?' (동시 작성)':'')+' ('+(idx+1)+'/'+total+')';
   renderStageDots(idx,total);
   if(animate){banner.classList.remove('stage-pulse');void banner.offsetWidth;banner.classList.add('stage-pulse');}}
 let mySide="",oppSide="",myAlias="",oppAlias="";
@@ -1025,18 +1145,22 @@ function renderSideBanner(topic){
     "<span class='desc'>「<span class='claim'>"+topic+"</span>」<br>"+verb+"</span>";
   document.title="["+mySide+"] 토론 중";}
 socket.on('match_found',d=>{currentRoom=d.room_id;myTurn=d.your_turn;totalStages=d.total_stages;
+  wantQueue=false;opening=!!d.opening;myOpeningDone=false;oppOpeningDone=false;judging=false;oppGone=false;
   if(d.min_length)minLength=d.min_length;
-  speakerAlias=d.speaker_alias;speakerSide=d.speaker_side;
   document.getElementById('profile-area').classList.add('hidden');
   document.getElementById('debate-area').classList.remove('hidden');
   mySide=d.my_side;oppSide=d.opp_side;myAlias=d.my_alias;oppAlias=d.opp_alias;
   document.getElementById('topic-area').innerText="📌 주제: "+d.topic;
   document.getElementById('role-area').innerHTML="🎭 내 이름: ["+d.my_alias+"] "+whoTag(d.my_side)+"  vs  상대: ["+d.opp_alias+"] "+whoTag(d.opp_side);
   renderSideBanner(d.topic);
-  renderCriteria(d.criteria);updateLenHint();
+  renderCriteria(d.criteria);
+  document.getElementById('chat-box').innerHTML='';
+  restoreDraft();
   showStage(d.stage,d.stage_index,d.total_stages,true);
   updateTurnUI(d.seconds_left);});
-socket.on('turn_change',d=>{myTurn=d.your_turn;
+socket.on('opening_submitted',()=>{myOpeningDone=true;updateTurnUI(remaining);});
+socket.on('opp_opening_submitted',()=>{oppOpeningDone=true;updateTimerText();});
+socket.on('turn_change',d=>{myTurn=d.your_turn;opening=false;
   speakerAlias=d.speaker_alias;speakerSide=d.speaker_side;
   showStage(d.stage,d.stage_index,totalStages,d.stage_changed);
   updateTurnUI(d.seconds_left);});
@@ -1045,29 +1169,32 @@ function updateTurnUI(seconds){const area=document.getElementById('debate-area')
   sur=document.getElementById('surrender-btn');
   // 상대 차례에도 입력창은 열어둔다 — 전송만 막는다
   input.disabled=false;
-  btn.disabled=!myTurn||oppGone;
+  btn.disabled=!canSend();
   if(sur)sur.disabled=oppGone;
-  if(myTurn){area.classList.add('turn-active');input.focus();}
+  if(canSend()){area.classList.add('turn-active');}
   else{area.classList.remove('turn-active');}
   if(!oppGone)startTimer(typeof seconds==='number'?seconds:remaining);
   updateLenHint();}
 function sendMessage(isAuto){const el=document.getElementById('msg-input'),msg=el.value.trim();
-  if(!myTurn)return alert('지금은 당신의 발언 차례가 아닙니다.\\n작성해둔 내용은 그대로 유지됩니다.');
+  if(!canSend()){
+    if(opening&&myOpeningDone)return alert('입론은 이미 제출했습니다.\\n작성해둔 내용은 다음 단계에 쓸 수 있도록 그대로 유지됩니다.');
+    return alert('지금은 당신의 발언 차례가 아닙니다.\\n작성해둔 내용은 그대로 유지됩니다.');}
   if(!msg)return alert('내용을 입력해주세요.');
   if(!isAuto&&msg.length<minLength){
     alert('⚠️ 발언이 너무 짧습니다.\\n\\n현재 '+msg.length+'자 / 최소 '+minLength+'자\\n\\n논거를 더 채워서 다시 시도해주세요.');
     el.focus();return;}
+  if(!isAuto&&opening&&!confirm('입론을 제출할까요?\\n\\n제출하면 고칠 수 없습니다. 남은 시간이 있으면 더 다듬어도 됩니다.'))return;
   stopTimer();
   socket.emit('send_message',{room_id:currentRoom,message:msg});
-  el.value="";updateLenHint();}
+  el.value="";saveDraft();updateLenHint();}
 socket.on('message_rejected',d=>{
   alert('⚠️ '+d.msg+'\\n\\n작성하신 내용은 입력창에 그대로 복원했습니다.');
   const el=document.getElementById('msg-input');
   if(!el.value.trim())el.value=d.text||"";
-  updateLenHint();el.focus();
-  if(myTurn)startTimer(remaining);});
-document.addEventListener('input',e=>{if(e.target.id==='msg-input')updateLenHint();});
-socket.on('surrendered',d=>{stopTimer();
+  saveDraft();updateLenHint();el.focus();
+  startTimer(remaining);});
+document.addEventListener('input',e=>{if(e.target.id==='msg-input'){updateLenHint();saveDraft();}});
+socket.on('surrendered',d=>{stopTimer();clearDrafts();
   alert("🏳️ 항복했습니다.\\n\\n"+d.headline+"\\n\\n"+d.reveal);location.reload();});
 function sideClass(side){return side==='찬성'?'pro':(side==='반대'?'con':'');}
 function appendMessage(cb,d,withPending){
@@ -1077,7 +1204,7 @@ function appendMessage(cb,d,withPending){
                " <span style='color:#9ca3af;font-weight:normal;'>"+d.sender+"</span>: ";
   const te=document.createElement('span');te.textContent=d.message;
   md.appendChild(ne);md.appendChild(te);cb.appendChild(md);
-  if(withPending){const sd=document.createElement('div');
+  if(withPending&&d.message!=='(시간 초과)'){const sd=document.createElement('div');
     sd.className='summary-item pending '+sideClass(d.side);
     sd.id='sum-'+d.msg_id;sd.textContent='🤖 AI 요약 생성 중...';cb.appendChild(sd);}}
 socket.on('receive_message',d=>{const cb=document.getElementById('chat-box');
@@ -1087,262 +1214,450 @@ socket.on('receive_summary',d=>{const sd=document.getElementById('sum-'+d.msg_id
   if(d.summary){sd.textContent='🤖 AI 요약: '+d.summary;}
   else{sd.remove();}   // 요약 실패 시 '생성 중'을 남겨두지 않는다
   const cb=document.getElementById('chat-box');cb.scrollTop=cb.scrollHeight;});
-socket.on('judging',d=>{stopTimer();
-  document.getElementById('turn-status').innerText="⚖️ "+d.msg;
+function showJudging(msg){stopTimer();judging=true;
+  document.getElementById('turn-status').innerText="⚖️ "+msg;
   document.getElementById('msg-input').disabled=true;
-  document.getElementById('send-btn').disabled=true;
+  document.getElementById('send-btn').disabled=true;}
+socket.on('judging',d=>{showJudging(d.msg);
   const cb=document.getElementById('chat-box');
   const el=document.createElement('div');el.className='summary-item pending';
   el.textContent='⚖️ '+d.msg;cb.appendChild(el);cb.scrollTop=cb.scrollHeight;});
-socket.on('opponent_left',d=>{stopTimer();
+socket.on('opponent_left',d=>{stopTimer();clearDrafts();
   alert("🚪 몰수승!\\n\\n"+(d.headline||"")+"\\n\\n"+d.reveal);location.reload();});
-socket.on('debate_end',d=>{stopTimer();alert("🔔 토론 완료! (+5점)\\n\\n[AI 판정]\\n"+d.result);location.reload();});
+socket.on('debate_end',d=>{stopTimer();clearDrafts();alert("🔔 토론 완료! (+5점)\\n\\n[AI 판정]\\n"+d.result);location.reload();});
 </script>
 </body></html>"""
 
-ADMIN_TEMPLATE = """<!DOCTYPE html>
-<html lang="ko"><head><meta charset="UTF-8"><title>운영자 설정</title>
+ADMIN_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>운영자 설정</title>
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-<style>body{font-family:'Malgun Gothic',sans-serif;max-width:700px;margin:30px auto;padding:20px;background:#f3f4f6;}
-.box{border:1px solid #e5e7eb;padding:20px;background:white;margin-bottom:15px;border-radius:12px;}
-.profile{padding:10px;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:8px;}
-.active{border:2px solid #2563eb;background:#eff6ff;}.ok{color:#16a34a}.bad{color:#dc2626}
-.msg{color:#1e3a8a;font-weight:bold;white-space:pre-line;background:#eff6ff;
-  border:1px solid #bfdbfe;border-radius:8px;padding:12px;font-size:0.92em;
-  word-break:break-word;overflow-wrap:anywhere;}
-table{width:100%;border-collapse:collapse;margin-bottom:14px;font-size:0.9em;}
-th{text-align:left;border-bottom:1px solid #e5e7eb;padding:4px;}
-td{border-bottom:1px solid #f3f4f6;padding:4px;}
+<style>
+body{font-family:'Malgun Gothic',sans-serif;max-width:760px;margin:20px auto;padding:0 14px 40px;background:#f3f4f6;color:#111827;}
+h2{margin:10px 0 12px;}
+.box{border:1px solid #e5e7eb;padding:16px;background:#fff;margin-bottom:14px;border-radius:12px;}
+.box h3{margin:0 0 10px;font-size:1.05em;}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;position:sticky;top:0;background:#f3f4f6;padding:8px 0;z-index:5;}
+.tabs button{background:#fff !important;color:#374151 !important;-webkit-text-fill-color:#374151;border:1px solid #d1d5db;}
+.tabs button.on{background:#2563eb !important;color:#fff !important;-webkit-text-fill-color:#fff;border-color:#2563eb;}
+.tabs button.danger.on{background:#dc2626 !important;border-color:#dc2626;}
+.lockbox{text-align:center;padding:30px 16px;}
+.lockbox .lk{font-size:2em;}
+.hint{font-size:0.82em;color:#6b7280;}
+.ok{color:#16a34a}.bad{color:#dc2626}
+table{width:100%;border-collapse:collapse;font-size:0.9em;margin:6px 0;}
+th{text-align:left;border-bottom:1px solid #e5e7eb;padding:5px 4px;color:#6b7280;font-weight:normal;}
+td{border-bottom:1px solid #f3f4f6;padding:6px 4px;}
+input[type=text],input[type=password],select{padding:8px;border:1px solid #d1d5db;border-radius:6px;
+  font-size:16px;background:#fff;color:#111827;max-width:100%;box-sizing:border-box;font-family:inherit;}
+button{-webkit-appearance:none;appearance:none;border:1px solid #93c5fd;border-radius:6px;background:#2563eb;
+  color:#fff !important;-webkit-text-fill-color:#fff;cursor:pointer;font-size:14px;font-weight:bold;
+  padding:8px 13px;margin:3px 4px 3px 0;font-family:inherit;}
+button.sub{background:#fff !important;color:#2563eb !important;-webkit-text-fill-color:#2563eb;}
+button.red{background:#dc2626 !important;border-color:#dc2626;}
+button.redline{background:#fff !important;color:#dc2626 !important;-webkit-text-fill-color:#dc2626;border-color:#fca5a5;}
+button:disabled{opacity:.5;cursor:not-allowed;}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0;}
+.chip{display:inline-block;padding:6px 10px;border:1px solid #d1d5db;border-radius:16px;margin:3px;cursor:pointer;background:#fff;font-size:0.92em;}
+.chip.sel{background:#dbeafe;border-color:#2563eb;font-weight:bold;}
+.chip .w{color:#9ca3af;font-size:0.85em;}
+.chip.res{border-style:dashed;}
+.switch{display:inline-flex;align-items:center;gap:8px;font-weight:bold;cursor:pointer;}
+.switch input{width:20px;height:20px;}
 .side-tag{display:inline-block;padding:1px 7px;border-radius:6px;font-size:0.8em;font-weight:bold;}
 .side-pro{background:#dcfce7;color:#166534;} .side-con{background:#fee2e2;color:#991b1b;}
-/* 토론별 접이식 패널 */
 .room{border:1px solid #e5e7eb;border-radius:8px;margin-bottom:8px;background:#f9fafb;overflow:hidden;}
-.room[open]{background:#fff;border-color:#c7d2fe;box-shadow:0 1px 3px rgba(0,0,0,.06);}
-.room > summary{padding:12px;cursor:pointer;line-height:1.5;list-style:none;}
+.room[open]{background:#fff;border-color:#c7d2fe;}
+.room.alert{border-color:#f59e0b;background:#fffbeb;}
+.room > summary{padding:10px 12px;cursor:pointer;line-height:1.5;list-style:none;}
 .room > summary::-webkit-details-marker{display:none;}
-.room > summary:hover{background:#eef2ff;}
-.room > summary::before{content:'▸ ';color:#9ca3af;}
-.room[open] > summary::before{content:'▾ ';color:#2563eb;}
 .room .body{padding:0 12px 12px;}
-.room .chat{height:260px;overflow-y:auto;border:1px solid #e5e7eb;padding:10px;
-  background:#f9fafb;border-radius:8px;font-size:0.9em;}
-.room .chat p{margin:6px 0;padding:6px 8px;border-radius:6px;border-left:3px solid #d1d5db;}
-.room .chat p.pro{border-left-color:#16a34a;background:#f0fdf4;}
-.room .chat p.con{border-left-color:#dc2626;background:#fef2f2;}
-.room .chat p.sys{border-left-color:#7c3aed;background:#faf5ff;color:#6b21a8;font-weight:bold;}
-.room .chat p.sum{border-left-color:#e5e7eb;background:transparent;color:#6b7280;font-size:0.92em;}
-.room .chat p.endmsg{border-left-color:#dc2626;background:#fef2f2;color:#991b1b;
-  font-weight:bold;white-space:pre-line;}
-.vs{color:#9ca3af;margin:4px 0;font-size:0.85em;}
-#watch-chat{height:300px;overflow-y:auto;border:1px solid #e5e7eb;padding:10px;background:#f9fafb;border-radius:8px;margin-top:10px;font-size:0.9em;}
-.hidden{display:none;}
-input[type=text],input[type=password]{padding:8px;border:1px solid #d1d5db;border-radius:6px;
-  font-size:16px;background:#fff;color:#111827;-webkit-appearance:none;appearance:none;
-  max-width:100%;box-sizing:border-box;}
-select{padding:8px 28px 8px 8px;border:1px solid #d1d5db;border-radius:6px;
-  font-size:16px;background:#fff;color:#111827;max-width:100%;
-  -webkit-appearance:none;appearance:none;
-  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8'><path d='M1 1l5 5 5-5' stroke='%23374151' stroke-width='2' fill='none'/></svg>");
-  background-repeat:no-repeat;background-position:right 9px center;}
-button,input[type=submit]{-webkit-appearance:none;appearance:none;
-  border:1px solid #93c5fd;border-radius:6px;background:#2563eb;color:#ffffff !important;
-  cursor:pointer;font-size:15px;font-weight:bold;padding:10px 16px;margin:4px 4px 4px 0;
-  font-family:inherit;-webkit-text-fill-color:#ffffff;}
-button:hover{background:#1d4ed8;}
-button:active{background:#1e40af;}
-.hint{font-size:0.82em;color:#6b7280;}
-fieldset{border:1px solid #e5e7eb;border-radius:8px;margin-bottom:12px;padding:12px;}
-legend{font-weight:bold;font-size:0.92em;color:#374151;padding:0 6px;}
-</style>
-</head><body><h2>🛠️ 운영자 설정</h2>
-{% if message %}<p class="msg">{{ message }}</p>{% endif %}
-
-<div class="box"><h3>🤖 AI 엔진</h3>
-<p>현재 활성: <b>{{ active }}</b></p>
-
-<form method="POST" action="/admin">
-{% for p in profiles %}
-<div class="profile {% if p.name == active %}active{% endif %}">
-<label><input type="radio" name="profile" value="{{ p.name }}" {% if p.name == active %}checked{% endif %}>
-<b>{{ p.name }}</b> — {{ p.provider }} / {{ p.model }}
-{% if p.key_ok %}<span class="ok">(키 등록됨 ✓ {{ p.masked }})</span>{% else %}<span class="bad">(키 미등록)</span>{% endif %}
-</label></div>
-{% endfor %}
-<div class="profile {% if active == '테스트 모드' %}active{% endif %}">
-<label><input type="radio" name="profile" value="테스트 모드" {% if active == '테스트 모드' %}checked{% endif %}>
-<b>테스트 모드</b> — AI 없이 동작</label></div>
-<p>운영자 코드: <input type="password" name="code" placeholder="코드 입력"></p>
-<button type="submit" name="action" value="switch" style="padding:8px 15px;">엔진 변경</button>
-<button type="submit" name="action" value="test" style="padding:8px 15px;">🔌 연결 테스트</button>
-</form>
+.room .chat{height:240px;overflow-y:auto;border:1px solid #e5e7eb;padding:8px;background:#f9fafb;border-radius:8px;font-size:0.9em;}
+.chat p{margin:5px 0;padding:6px 8px;border-radius:6px;border-left:3px solid #d1d5db;white-space:pre-line;}
+.chat p.pro{border-left-color:#16a34a;background:#f0fdf4;}
+.chat p.con{border-left-color:#dc2626;background:#fef2f2;}
+.chat p.sys{border-left-color:#7c3aed;background:#faf5ff;color:#6b21a8;font-weight:bold;}
+.chat p.sum{border-left-color:#e5e7eb;background:transparent;color:#6b7280;font-size:0.92em;}
+.chat p.endmsg{border-left-color:#dc2626;background:#fef2f2;color:#991b1b;font-weight:bold;}
+.pend{border:1px solid #fcd34d;background:#fffbeb;border-radius:8px;padding:10px;margin-bottom:8px;font-size:0.92em;}
+.pend.fail{border-color:#fca5a5;background:#fef2f2;}
+.pend .why{white-space:pre-line;color:#374151;margin:6px 0;}
+.warn{background:#fef2f2;border:1px solid #fca5a5;color:#991b1b;padding:10px;border-radius:8px;font-size:0.9em;}
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;max-width:92%;background:#111827;color:#fff;
+  padding:10px 16px;border-radius:10px;font-size:0.92em;white-space:pre-line;display:none;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.25);}
+#toast.err{background:#b91c1c;}
+.nav{font-size:0.88em;} .nav a{color:#2563eb;text-decoration:none;}
+</style></head><body>
+<h2>🛠️ 운영자 설정</h2>
+<div class="tabs" id="tabs">
+{% for key, label in tabs.items() %}<button data-tab="{{ key }}" class="{{ 'danger' if key == 'danger' else '' }}" onclick="openTab('{{ key }}')">{{ {'ops':'🎮','ai':'🤖','users':'👤','danger':'🗑️'}[key] }} {{ label }}</button>{% endfor %}
 </div>
 
-<div class="box"><h3>🔑 AI 툴 등록 / 변경</h3>
-<p class="hint">이름과 API 키를 등록하면 바로 사용할 수 있습니다. 같은 이름으로 다시 등록하면 덮어쓰기(키 변경)가 됩니다.<br>
-키는 데이터베이스에 저장되므로 재배포해도 유지됩니다.</p>
-
-<form method="POST" action="/admin">
-<fieldset><legend>등록 / 수정</legend>
-<p>이름 <input type="text" name="p_name" placeholder="예: Gemini" style="width:150px;">
-&nbsp;제공사
-<select name="p_provider">
-  {% for pv in providers %}<option value="{{ pv }}">{{ pv }}</option>{% endfor %}
-</select></p>
-<p>모델 <input type="text" name="p_model" placeholder="비우면 기본 모델 사용" style="width:220px;"></p>
-<p>API 키 <input type="text" name="p_key" placeholder="키 입력 (비우면 기존 키 유지)" style="width:340px;"></p>
-<label class="hint"><input type="checkbox" name="p_activate" value="1" checked> 등록 후 바로 이 툴을 활성화</label>
-</fieldset>
-
-<fieldset><legend>삭제</legend>
-<p>이름 <input type="text" name="del_name" placeholder="삭제할 툴 이름" style="width:150px;"></p>
-</fieldset>
-
-<p>운영자 코드: <input type="password" name="code" placeholder="코드 입력"></p>
-<button type="submit" name="action" value="save_profile" style="padding:8px 15px;">저장</button>
-<button type="submit" name="action" value="delete_profile" style="padding:8px 15px;" onclick="return confirm('정말 삭제하시겠습니까?')">삭제</button>
-</form>
-
-<p class="hint">기본 모델 — gemini: {{ default_models['gemini'] }} / openai: {{ default_models['openai'] }} / anthropic: {{ default_models['anthropic'] }}</p>
+<div id="lock" class="box lockbox">
+  <div class="lk">🔒</div>
+  <p id="lock-title" style="font-weight:bold;">탭을 선택하세요</p>
+  <div id="lock-form" style="display:none;">
+    <input type="password" id="lock-code" placeholder="운영자 코드" autocomplete="off" style="width:200px;">
+    <button onclick="unlock()">열기</button>
+    <p class="hint">한 번 열면 이 탭 안에서는 코드 없이 작업할 수 있습니다.<br>다른 탭으로 가거나 새로고침하면 다시 잠깁니다.</p>
+  </div>
 </div>
 
-<div class="box"><h3>👤 아이디 생성 및 관리</h3>
-<table>
-<tr><th>아이디</th><th>전적</th><th>점수</th></tr>
-{% for u in users %}<tr><td>{{u.username}}</td><td>{{u.wins}}승 {{u.losses}}패</td><td>{{u.points}}</td></tr>{% endfor %}
-</table>
-<form method="POST" action="/admin">
-<p><b>생성:</b> 아이디 <input type="text" name="new_username" placeholder="새 아이디" style="width:130px;"> PIN <input type="text" name="new_pin" placeholder="4자리 이상" style="width:110px;"></p>
-<p><b>PIN 변경:</b> 아이디 <input type="text" name="edit_username" placeholder="대상 아이디" style="width:130px;"> 새 PIN <input type="text" name="edit_pin" placeholder="4자리 이상" style="width:110px;"></p>
-<p><b>삭제:</b> 아이디 <input type="text" name="delete_username" placeholder="삭제할 아이디" style="width:130px;"></p>
-<p>운영자 코드: <input type="password" name="code" placeholder="코드 입력"></p>
-<button type="submit" name="action" value="create_user" style="padding:8px 15px;">생성</button>
-<button type="submit" name="action" value="edit_user" style="padding:8px 15px;">PIN 변경</button>
-<button type="submit" name="action" value="delete_user" style="padding:8px 15px;" onclick="return confirm('정말 삭제하시겠습니까?')">삭제</button>
-</form></div>
+<!-- ───────── 대회 운영 ───────── -->
+<div id="panel-ops" class="panel" style="display:none;">
+  <div class="box">
+    <h3>🎯 매칭 방식</h3>
+    <label class="switch"><input type="checkbox" id="auto-match" onchange="setAuto(this.checked)">
+      <span id="auto-label">자동(랜덤) 매칭</span></label>
+    <p class="hint">켜면: 대기실에 들어온 사람끼리 랜덤으로 붙습니다 (예약된 사람은 제외).<br>
+    끄면: 대기실에 쌓이기만 하고, 아래에서 운영자가 직접 붙입니다. 토너먼트 때는 끄세요.</p>
+  </div>
 
-<div class="box"><h3>🩺 AI 호출 상태 (오늘)</h3>
-{% if quota_hit %}
-<p style="background:#fef2f2;border:1px solid #fca5a5;color:#991b1b;padding:10px;border-radius:8px;">
-⚠️ 최근 호출에서 <b>사용량 한도 초과(429)</b>가 감지되었습니다. 무료 한도를 다 쓰면 주제 추천·요약·심사가 모두 실패하고,
-심사는 <b>심사실패</b>로 기록됩니다. 하루가 지나 한도가 초기화되길 기다리거나 다른 키를 등록하세요.</p>
-{% endif %}
-<table>
-<tr><th>종류</th><th>성공</th><th>실패</th></tr>
-{% for kind, s in ai_stats.items() %}
-<tr><td>{{ kind }}</td><td class="ok">{{ s.ok }}</td>
-<td class="{% if s.fail %}bad{% endif %}">{{ s.fail }}</td></tr>
-{% else %}<tr><td colspan="3">오늘 호출 기록이 없습니다.</td></tr>{% endfor %}
-</table>
-<p class="hint">토론 1회당 호출 수 = 주제 1 + 요약 8 + 심사 1 ≈ <b>10회</b>. 요약이 가장 많이 씁니다.</p>
-<p style="background:#f0f9ff;border:1px solid #bae6fd;padding:10px;border-radius:8px;">
-📊 최근 1분간 호출: <b>{{ rpm_used }}회</b> / 상한 {{ rpm_limit }}회
-{% if rpm_used >= rpm_limit %}<span class="bad">— 대기 중</span>{% endif %}
-<br><span class="hint">Gemini 무료 한도는 <b>분당 20회</b>입니다. 상한을 그보다 낮게 두면
-한도 초과 자체가 일어나지 않고, 요약은 붐빌 때 자동으로 건너뜁니다.</span></p>
-<form method="POST" action="/admin">
-<p><label><input type="checkbox" name="summary_on" value="1" {% if summary_on %}checked{% endif %}>
-발언 요약 사용 (끄면 AI 호출이 <b>10회 → 2회</b>로 줄어 한도 부족 시 유용)</label></p>
-<p>분당 호출 상한 <input type="text" name="max_rpm" value="{{ rpm_limit }}" style="width:70px;">
-<span class="hint">권장 15 — 무료 한도 20보다 여유 있게</span></p>
-<p>운영자 코드: <input type="password" name="code" placeholder="코드 입력"></p>
-<button type="submit" name="action" value="toggle_summary" style="padding:8px 15px;">설정 저장</button>
-</form>
-{% if backup_count %}
-<p class="hint">🔑 예비 키 {{ backup_count }}개 등록됨 — 활성 키가 한도에 걸리면 자동으로 넘어갑니다.</p>
-{% else %}
-<p class="hint">🔑 예비 키가 없습니다. 다른 구글 계정으로 키를 하나 더 만들어 등록해두면,
-한도에 걸렸을 때 자동으로 그 키를 씁니다.</p>
-{% endif %}
-<details style="margin-top:10px;"><summary>최근 호출 15건</summary>
-<table>
-<tr><th>시각</th><th>종류</th><th>결과</th><th>내용</th></tr>
-{% for c in ai_recent %}
-<tr><td>{{ c.at[11:] }}</td><td>{{ c.kind }}</td>
-<td class="{% if c.ok %}ok{% else %}bad{% endif %}">{{ '성공' if c.ok else '실패' }}</td>
-<td style="font-size:0.85em;word-break:break-all;">{{ c.error[:90] if c.error else (c.ms|string + 'ms') }}</td></tr>
-{% else %}<tr><td colspan="4">기록 없음</td></tr>{% endfor %}
-</table></details>
+  <div class="box">
+    <h3>🧑‍🤝‍🧑 대기실 <span id="wait-count" class="hint"></span></h3>
+    <div id="waiting"></div>
+    <p class="hint">이름을 누르면 아래 A → B 칸에 차례로 들어갑니다. 점선 = 예약된 사람</p>
+    <div class="row">
+      <input type="text" id="pa" placeholder="A 아이디" style="width:130px;">
+      <span>vs</span>
+      <input type="text" id="pb" placeholder="B 아이디" style="width:130px;">
+      <select id="pside">
+        <option value="random">진영 랜덤</option>
+        <option value="a_pro">A 찬성 / B 반대</option>
+        <option value="a_con">A 반대 / B 찬성</option>
+      </select>
+    </div>
+    <div class="row">
+      <input type="text" id="ptopic" placeholder="주제 직접 지정 (비우면 AI 주제)" style="flex:1;min-width:220px;">
+    </div>
+    <div class="row">
+      <button onclick="pairNow()">⚡ 지금 매칭</button>
+      <button class="sub" onclick="reserve()">📌 예약 등록</button>
+      <button class="sub" onclick="clearPair()">비우기</button>
+    </div>
+    <p class="hint"><b>지금 매칭</b>: 두 사람이 대기실에 있어야 합니다. 바로 시작.<br>
+    <b>예약 등록</b>: 아직 안 들어왔어도 됩니다. 둘 다 대기실에 들어오면 자동으로 시작.</p>
+    <div id="reservations"></div>
+  </div>
+
+  <div class="box" id="pending-box" style="display:none;">
+    <h3>⚖️ 운영자 확인 필요</h3>
+    <div id="pending"></div>
+  </div>
+
+  <div class="box">
+    <h3>🔴 진행 중인 토론 <span id="room-count" class="hint"></span></h3>
+    <p class="hint">눌러서 펼치면 실시간으로 볼 수 있습니다. 목록은 4초마다 갱신됩니다.</p>
+    <div id="rooms"></div>
+  </div>
 </div>
 
-<div class="box"><h3>🔴 실시간 관전</h3>
-<p>운영자 코드: <input type="password" id="watch-code" placeholder="코드 입력"></p>
-<button onclick="loadRooms()" style="padding:8px 15px;">진행 중인 토론 불러오기</button>
-<p class="hint">토론을 눌러 펼치면 그 자리에서 바로 내용이 보입니다. 여러 개를 동시에 펼쳐둘 수 있습니다.</p>
-<div id="room-list" style="margin-top:10px;"></div>
+<!-- ───────── AI 설정 ───────── -->
+<div id="panel-ai" class="panel" style="display:none;">
+  <div class="box">
+    <h3>🤖 사용할 AI (ChatGPT)</h3>
+    <div id="ai-warn"></div>
+    <div id="profiles"></div>
+    <div class="row"><button onclick="switchAI()">선택한 AI로 변경</button>
+      <button class="sub" onclick="testAI()">🔌 연결 테스트</button></div>
+    <pre id="test-out" class="hint" style="white-space:pre-wrap;"></pre>
+  </div>
+  <div class="box">
+    <h3>🔑 키 등록 / 변경</h3>
+    <p class="hint">같은 이름으로 다시 저장하면 덮어씁니다. 키는 DB에 저장돼 재배포해도 유지됩니다.</p>
+    <div class="row"><input type="text" id="ai-name" placeholder="이름 (예: ChatGPT)" style="width:150px;">
+      <input type="text" id="ai-model" placeholder="모델" style="width:180px;"></div>
+    <div class="row"><input type="password" id="ai-key" placeholder="API 키 (비우면 기존 키 유지)" style="flex:1;min-width:240px;" autocomplete="off"></div>
+    <label class="hint"><input type="checkbox" id="ai-activate" checked> 저장 후 바로 이 AI 사용</label>
+    <div class="row"><button onclick="saveAI()">저장</button></div>
+  </div>
+  <div class="box">
+    <h3>⚙️ 심사·호출 설정</h3>
+    <p><label><input type="checkbox" id="set-draw"> 무승부 허용 <span class="hint">(끄면 AI가 반드시 승자를 정함 — 토너먼트용)</span></label></p>
+    <p><label><input type="checkbox" id="set-summary"> 발언 요약 사용 <span class="hint">(끄면 토론당 호출 약 10회 → 2회)</span></label></p>
+    <p>분당 호출 상한 <input type="text" id="set-rpm" style="width:80px;"> <span class="hint" id="rpm-now"></span></p>
+    <button onclick="saveSettings()">설정 저장</button>
+  </div>
+  <div class="box">
+    <h3>🩺 오늘 AI 호출</h3>
+    <div id="ai-stats"></div>
+    <details><summary class="hint">최근 15건</summary><div id="ai-recent"></div></details>
+  </div>
+</div>
+
+<!-- ───────── 아이디 관리 ───────── -->
+<div id="panel-users" class="panel" style="display:none;">
+  <div class="box">
+    <h3>➕ 아이디 생성</h3>
+    <div class="row"><input type="text" id="nu" placeholder="새 아이디" style="width:140px;">
+      <input type="text" id="np" placeholder="PIN (4자리 이상)" style="width:140px;">
+      <button onclick="createUser()">생성</button></div>
+    <h3 style="margin-top:16px;">🔁 PIN 변경</h3>
+    <div class="row"><input type="text" id="eu" placeholder="아이디" style="width:140px;">
+      <input type="text" id="ep" placeholder="새 PIN" style="width:140px;">
+      <button onclick="changePin()">변경</button></div>
+  </div>
+  <div class="box"><h3>📋 아이디 목록 <span id="user-count" class="hint"></span></h3><div id="user-table"></div></div>
+</div>
+
+<!-- ───────── 삭제 ───────── -->
+<div id="panel-danger" class="panel" style="display:none;">
+  <div class="box">
+    <h3>🗑️ 아이디 삭제</h3>
+    <p class="hint">삭제하면 전적도 함께 사라지고 되돌릴 수 없습니다.</p>
+    <div id="del-users"></div>
+  </div>
+  <div class="box">
+    <h3>🗑️ AI 키 삭제</h3>
+    <div id="del-profiles"></div>
+  </div>
 </div>
 
 <p class="nav"><a href="/">← 토론 화면</a> · <a href="/ranking">🏆 랭킹</a> · <a href="/history">📚 토론 기록</a></p>
+<div id="toast"></div>
+
 <script>
+const TAB_NAMES={{ tabs|tojson }};
+let token=null, tab=null, poll=null;
 const wsocket=io();
-const openRooms=new Set();   // 펼쳐둔 토론 — 목록을 새로 불러와도 유지
-function loadRooms(){
-  const code=document.getElementById('watch-code').value;
-  fetch('/admin/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})})
-    .then(r=>r.json()).then(data=>{
-      if(data.error){alert(data.error);return;}
-      const list=document.getElementById('room-list');list.innerHTML='';
-      if(data.rooms.length===0){list.innerHTML='<p>진행 중인 토론이 없습니다.</p>';return;}
-      data.rooms.forEach(rm=>{
-        const wasOpen=openRooms.has(rm.room_id);
-        const det=document.createElement('details');
-        det.className='room';det.open=wasOpen;
-        const who=rm.players.map(p=>{
-          const tag="<span class='side-tag "+(p.side==='찬성'?'side-pro':'side-con')+"'>"+p.side+"</span>";
-          const net=p.connected?'':" <span style='color:#dc2626;'>⚠️끊김</span>";
-          const now=p.speaking?" <span style='color:#2563eb;'>◀ 발언 중</span>":"";
-          return "<b>"+p.username+"</b> "+tag+net+now+
-                 " <span style='color:#9ca3af;font-size:0.85em;'>("+p.alias+")</span>";
-        }).join("<div class='vs'>vs</div>");
-        const sum=document.createElement('summary');
-        sum.innerHTML="<span style='font-weight:bold;'>📌 "+rm.topic+"</span>"+
-          "<div style='font-size:0.85em;color:#6b7280;margin:4px 0 6px;'>"+
-          rm.stage+" ("+(rm.stage_index+1)+"/"+rm.total_stages+") · 발언 "+rm.turns+"회 · "+
-          rm.elapsed_min+"분 경과</div>"+who;
-        const body=document.createElement('div');body.className='body';
-        body.innerHTML="<div class='chat' id='chat-"+rm.room_id+"'>"+
-          "<p style='border:none;color:#9ca3af;'>불러오는 중...</p></div>";
-        det.appendChild(sum);det.appendChild(body);
-        det.addEventListener('toggle',()=>{
-          if(det.open){openRooms.add(rm.room_id);watchRoom(rm.room_id,code);}
-          else{openRooms.delete(rm.room_id);}
-        });
-        list.appendChild(det);
-        if(wasOpen)watchRoom(rm.room_id,code);   // 새로고침해도 펼친 상태 유지
-      });
-    });
+const openRooms=new Set();
+const roomEls={};
+
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function toast(msg,isErr){const t=document.getElementById('toast');t.textContent=msg;
+  t.className=isErr?'err':'';t.style.display='block';clearTimeout(toast._t);
+  toast._t=setTimeout(()=>t.style.display='none',isErr?6000:3500);}
+function sideTag(s){return "<span class='side-tag "+(s==='찬성'?'side-pro':'side-con')+"'>"+esc(s)+"</span>";}
+function fmtSec(s){s=Math.max(0,s|0);return Math.floor(s/60)+":"+String(s%60).padStart(2,'0');}
+
+// ── 탭 잠금 ──
+function lockCurrent(){
+  if(token){const t=token;token=null;
+    fetch('/admin/api/lock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t}),keepalive:true});}
+  clearInterval(poll);poll=null;
 }
-function watchRoom(roomId,code){
-  wsocket.emit('admin_watch',{code:code||document.getElementById('watch-code').value,
-                              room_id:roomId});
+function showLock(t){
+  document.querySelectorAll('.panel').forEach(p=>p.style.display='none');
+  document.getElementById('lock').style.display='';
+  document.getElementById('lock-title').textContent='🔐 '+TAB_NAMES[t]+' 탭 — 운영자 코드를 입력하세요';
+  document.getElementById('lock-form').style.display='';
+  const c=document.getElementById('lock-code');c.value='';setTimeout(()=>c.focus(),50);
 }
-function chatBox(roomId){return document.getElementById('chat-'+roomId);}
-function addLine(roomId,html,cls){
-  const box=chatBox(roomId);if(!box)return null;
-  const el=document.createElement('p');if(cls)el.className=cls;
-  el.innerHTML=html;box.appendChild(el);box.scrollTop=box.scrollHeight;return el;
+function openTab(t){
+  if(t===tab&&token)return;
+  lockCurrent();tab=t;
+  document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));
+  showLock(t);
 }
-function lineHtml(line){
-  const label=line.side+(line.side==='찬성'?'':'');
-  return "<b>["+line.stage+"] "+label+":</b> "+
-         (line.message||'').replace(/</g,'&lt;');
+async function unlock(){
+  const code=document.getElementById('lock-code').value;
+  if(!code)return;
+  const r=await fetch('/admin/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({tab,code})});
+  const d=await r.json().catch(()=>({error:'서버 응답 오류'}));
+  if(!r.ok){toast(d.error||'실패',true);document.getElementById('lock-code').value='';return;}
+  token=d.token;
+  document.getElementById('lock').style.display='none';
+  document.getElementById('panel-'+tab).style.display='';
+  loadTab();
 }
-function sideCls(side){return side==='찬성'?'pro':'con';}
-wsocket.on('admin_history',d=>{
-  const box=chatBox(d.room_id);if(!box)return;
-  box.innerHTML='';
-  if(!d.logs.length)addLine(d.room_id,'<span style="color:#9ca3af;">아직 발언이 없습니다.</span>','sum');
-  d.logs.forEach(l=>addLine(d.room_id,lineHtml(l),sideCls(l.side)));
-});
-wsocket.on('admin_message',d=>{
-  const el=addLine(d.room_id,lineHtml(d),sideCls(d.side));
-  if(el&&d.msg_id)el.id='wmsg-'+d.msg_id;
-});
+document.getElementById('lock-code').addEventListener('keydown',e=>{if(e.key==='Enter')unlock();});
+window.addEventListener('pagehide',lockCurrent);
+
+async function api(path,body){
+  const r=await fetch('/admin/api/'+path,{method:'POST',
+    headers:{'Content-Type':'application/json','X-Admin-Token':token||''},body:JSON.stringify(body||{})});
+  const d=await r.json().catch(()=>({error:'서버 응답 오류 ('+r.status+')'}));
+  if(r.status===401&&d.locked){token=null;clearInterval(poll);toast('탭이 잠겼습니다. 코드를 다시 입력해주세요.',true);showLock(tab);throw new Error('locked');}
+  if(!r.ok||d.error){toast(d.error||'실패',true);throw new Error(d.error);}
+  if(d.msg)toast(d.msg,d.ok===false);
+  return d;
+}
+function loadTab(){
+  if(tab==='ops'){refreshOps();wsocket.emit('admin_watch',{token});poll=setInterval(refreshOps,4000);
+    openRooms.forEach(id=>wsocket.emit('admin_watch',{token,room_id:id}));}
+  if(tab==='ai')refreshAI();
+  if(tab==='users')refreshUsers();
+  if(tab==='danger')refreshDanger();
+}
+
+// ── 대회 운영 ──
+let opsState=null;
+async function refreshOps(){
+  if(tab!=='ops'||!token)return;
+  let d;try{d=await api('ops/state');}catch(e){return;}
+  opsState=d;
+  const am=document.getElementById('auto-match');am.checked=d.auto_match;
+  document.getElementById('auto-label').textContent='자동(랜덤) 매칭 '+(d.auto_match?'켜짐':'꺼짐 — 운영자 배정');
+  document.getElementById('wait-count').textContent='('+d.waiting.length+'명)';
+  const pa=document.getElementById('pa').value,pb=document.getElementById('pb').value;
+  document.getElementById('waiting').innerHTML=d.waiting.length?d.waiting.map(w=>
+    "<span class='chip"+(w.reserved?' res':'')+(w.username===pa||w.username===pb?' sel':'')+"' onclick=\"pick('"+esc(w.username)+"')\">"+
+    esc(w.username)+" <span class='w'>"+fmtSec(w.wait_sec)+"</span></span>").join(''):
+    "<p class='hint'>대기 중인 사람이 없습니다.</p>";
+  const sideTxt={random:'진영 랜덤',a_pro:'A 찬성',a_con:'A 반대'};
+  document.getElementById('reservations').innerHTML=d.reservations.length?
+    "<p style='margin:10px 0 4px;font-weight:bold;'>📌 예약 ("+d.reservations.length+")</p>"+
+    d.reservations.map(r=>"<div class='row'><span><b>"+esc(r.a)+"</b> vs <b>"+esc(r.b)+"</b> · "+sideTxt[r.side]+
+      (r.topic?" · 주제: "+esc(r.topic):"")+"</span><button class='redline' onclick=\"unreserve('"+r.id+"')\">삭제</button></div>").join(''):'';
+  renderPending(d.pending);
+  renderRooms(d.rooms,d.absent_alert);
+}
+function pick(name){
+  const a=document.getElementById('pa'),b=document.getElementById('pb');
+  if(a.value===name){a.value='';}else if(b.value===name){b.value='';}
+  else if(!a.value){a.value=name;}else{b.value=name;}
+  if(opsState)refreshOpsChips();
+}
+function refreshOpsChips(){const pa=document.getElementById('pa').value,pb=document.getElementById('pb').value;
+  document.querySelectorAll('#waiting .chip').forEach(c=>{const n=c.firstChild.textContent.trim();
+    c.classList.toggle('sel',n===pa||n===pb);});}
+function clearPair(){['pa','pb','ptopic'].forEach(i=>document.getElementById(i).value='');refreshOpsChips();}
+function pairBody(){return {a:document.getElementById('pa').value.trim(),b:document.getElementById('pb').value.trim(),
+  side:document.getElementById('pside').value,topic:document.getElementById('ptopic').value.trim()};}
+async function pairNow(){try{await api('ops/pair',pairBody());clearPair();}catch(e){}refreshOps();}
+async function reserve(){try{await api('ops/reserve',pairBody());clearPair();}catch(e){}refreshOps();}
+async function unreserve(id){try{await api('ops/unreserve',{id});}catch(e){}refreshOps();}
+async function setAuto(on){try{await api('ops/auto',{on});}catch(e){}refreshOps();}
+
+function renderPending(list){
+  const box=document.getElementById('pending-box');
+  box.style.display=list.length?'':'none';
+  document.getElementById('pending').innerHTML=list.map(p=>{
+    const head="<b>📌 "+esc(p.topic)+"</b><br><span class='hint'>"+esc(p.played_at)+" · "+
+      esc(p.player_a)+" "+sideTag(p.side_a)+" vs "+esc(p.player_b)+" "+sideTag(p.side_b)+"</span>";
+    if(p.winner==='판정대기'){const pd=p.pending||{};
+      return "<div class='pend'>"+head+"<div class='why'>⚠️ AI 지적: <b>"+esc(pd.no_will_side)+"</b>측 토론 의지 없음\n"+
+        esc(pd.no_will_reason||'')+"\n\n[AI 원래 판정]\n"+esc(pd.text||'')+"</div>"+
+        "<button class='red' onclick=\"resolve("+p.id+",'forfeit_pro')\">찬성 몰수패</button>"+
+        "<button class='red' onclick=\"resolve("+p.id+",'forfeit_con')\">반대 몰수패</button>"+
+        "<button class='sub' onclick=\"resolve("+p.id+",'dismiss')\">기각 → AI 판정대로</button>"+
+        "<details><summary class='hint'>토론 전문</summary><div id='plog-"+p.id+"' class='hint'>기록 페이지(/history)에서 볼 수 있습니다.</div></details></div>";}
+    return "<div class='pend fail'>"+head+"<div class='why'>"+esc((p.reason||'').split('\n\n')[0])+"</div>"+
+      (p.rejudging?"<span class='hint'>⏳ 다시 심사하는 중...</span>":
+      "<button onclick='rejudge("+p.id+")'>🔁 다시 심사</button>")+"</div>";
+  }).join('');
+}
+async function resolve(id,action){
+  const label={forfeit_pro:'찬성측 몰수패',forfeit_con:'반대측 몰수패',dismiss:'기각(AI 판정 적용)'}[action];
+  if(!confirm(label+'(으)로 처리할까요?'))return;
+  try{await api('ops/resolve',{id,action});}catch(e){}refreshOps();}
+async function rejudge(id){try{await api('ops/rejudge',{id});}catch(e){}refreshOps();}
+
+function renderRooms(list,alertSec){
+  document.getElementById('room-count').textContent='('+list.length+'개)';
+  const wrap=document.getElementById('rooms');
+  const live=new Set(list.map(r=>r.room_id));
+  list.forEach(rm=>{
+    let el=roomEls[rm.room_id];
+    if(!el){
+      el=document.createElement('details');el.className='room';
+      el.innerHTML="<summary></summary><div class='body'><div class='chat' id='chat-"+rm.room_id+"'><p class='sum'>불러오는 중...</p></div>"+
+        "<div class='row' style='margin-top:8px;'><button class='redline' onclick=\"stopRoom('"+rm.room_id+"')\">⏹️ 토론 중단 (승패 없음·재경기)</button></div></div>";
+      el.addEventListener('toggle',()=>{if(el.open){openRooms.add(rm.room_id);wsocket.emit('admin_watch',{token,room_id:rm.room_id});}
+        else openRooms.delete(rm.room_id);});
+      roomEls[rm.room_id]=el;wrap.appendChild(el);
+    }
+    const absent=rm.players.some(p=>!p.connected&&p.absent_sec>=alertSec);
+    el.classList.toggle('alert',absent);
+    const who=rm.players.map(p=>{
+      let st='';
+      if(!p.connected)st=" <span class='bad'>⚠️끊김 "+fmtSec(p.absent_sec)+"</span>";
+      else if(p.opening_done)st=" <span class='ok'>✓제출</span>";
+      else if(p.speaking)st=" <span style='color:#2563eb;'>◀ 작성 중</span>";
+      return "<b>"+esc(p.username)+"</b> "+sideTag(p.side)+st;}).join(" &nbsp;vs&nbsp; ");
+    el.querySelector('summary').innerHTML="▸ <b>"+esc(rm.topic)+"</b><div class='hint'>"+esc(rm.stage)+
+      " · 발언 "+rm.turns+"회 · "+rm.elapsed_min+"분 경과 · 남은 "+fmtSec(rm.seconds_left)+(rm.paused?" (⏸ 정지)":"")+"</div>"+who+
+      (absent?"<div class='bad' style='font-size:0.85em;margin-top:4px;'>오래 끊겨 있습니다. 계속 기다리거나, 중단 후 재경기를 배정하세요.</div>":"");
+  });
+  Object.keys(roomEls).forEach(id=>{if(!live.has(id)&&!roomEls[id].open){roomEls[id].remove();delete roomEls[id];openRooms.delete(id);}});
+}
+async function stopRoom(id){
+  if(!confirm('이 토론을 중단할까요?\n승패는 기록되지 않고 두 사람은 대기 화면으로 돌아갑니다.'))return;
+  try{await api('ops/stop',{room_id:id});}catch(e){}refreshOps();}
+
+function addLine(roomId,text,cls){const box=document.getElementById('chat-'+roomId);if(!box)return null;
+  const el=document.createElement('p');if(cls)el.className=cls;el.textContent=text;box.appendChild(el);
+  box.scrollTop=box.scrollHeight;return el;}
+function sideCls(s){return s==='찬성'?'pro':'con';}
+wsocket.on('admin_history',d=>{const box=document.getElementById('chat-'+d.room_id);if(!box)return;box.innerHTML='';
+  if(!d.logs.length)addLine(d.room_id,'아직 공개된 발언이 없습니다. (입론은 둘 다 내면 함께 공개)','sum');
+  d.logs.forEach(l=>addLine(d.room_id,'['+l.stage+'] '+l.side+': '+l.message,sideCls(l.side)));});
+wsocket.on('admin_message',d=>addLine(d.room_id,'['+d.stage+'] '+d.side+': '+d.message,sideCls(d.side)));
 wsocket.on('admin_summary',d=>addLine(d.room_id,'🤖 요약: '+d.summary,'sum'));
-wsocket.on('admin_stage',d=>addLine(d.room_id,'▶ 단계 전환: '+d.stage,'sys'));
-wsocket.on('admin_end',d=>{
-  const el=addLine(d.room_id,'','endmsg');
-  if(el)el.textContent='🔔 토론 종료\\n'+d.result;});
-wsocket.on('error_msg',d=>alert(d.msg));
+wsocket.on('admin_stage',d=>addLine(d.room_id,'▶ '+d.stage,'sys'));
+wsocket.on('admin_end',d=>{addLine(d.room_id,'🔔 토론 종료\n'+d.result,'endmsg');refreshOps();});
+wsocket.on('admin_alert',d=>{toast(d.msg);refreshOps();});
+wsocket.on('admin_locked',()=>{});
+wsocket.on('error_msg',d=>toast(d.msg,true));
+wsocket.on('connect',()=>{if(tab==='ops'&&token){wsocket.emit('admin_watch',{token});
+  openRooms.forEach(id=>wsocket.emit('admin_watch',{token,room_id:id}));}});
+
+// ── AI 설정 ──
+async function refreshAI(){
+  let d;try{d=await api('ai/state');}catch(e){return;}
+  let warn='';
+  if(d.billing_hit)warn+="<p class='warn'>⚠️ 최근 <b>크레딧/결제 한도 소진(insufficient_quota)</b>이 있었습니다. platform.openai.com → Billing에서 크레딧을 확인하세요. 이 상태면 심사가 전부 실패합니다.</p>";
+  if(d.rate_hit)warn+="<p class='warn' style='background:#fffbeb;border-color:#fcd34d;color:#92400e;'>최근 분당 한도(429)에 걸린 적이 있습니다. 보통 몇 초 안에 풀립니다. 자주 뜨면 발언 요약을 끄세요.</p>";
+  document.getElementById('ai-warn').innerHTML=warn;
+  const all=d.profiles.concat([{name:'테스트 모드',model:'AI 없이 동작',key_ok:true,masked:''}]);
+  document.getElementById('profiles').innerHTML=all.map(p=>
+    "<label style='display:block;padding:8px;border:"+(p.name===d.active?'2px solid #2563eb':'1px solid #e5e7eb')+
+    ";border-radius:8px;margin-bottom:6px;'><input type='radio' name='prof' value='"+esc(p.name)+"' "+(p.name===d.active?'checked':'')+
+    "> <b>"+esc(p.name)+"</b> — "+esc(p.model)+" "+(p.masked?"<span class='hint'>"+esc(p.masked)+"</span>":"")+
+    (p.redirect?" <span class='bad'>(모델 없음 → "+esc(p.redirect)+" 사용 중)</span>":"")+"</label>").join('')+
+    (d.profiles.length?'':"<p class='warn'>등록된 ChatGPT 키가 없습니다. 아래에서 등록하세요.</p>");
+  document.getElementById('ai-model').placeholder='모델 (비우면 '+d.default_model+')';
+  document.getElementById('set-draw').checked=d.allow_draw;
+  document.getElementById('set-summary').checked=d.summary_on;
+  document.getElementById('set-rpm').value=d.rpm_limit;
+  document.getElementById('rpm-now').textContent='최근 1분 '+d.rpm_used+'회 사용';
+  const st=Object.entries(d.stats);
+  document.getElementById('ai-stats').innerHTML=st.length?"<table><tr><th>종류</th><th>성공</th><th>실패</th></tr>"+
+    st.map(([k,s])=>"<tr><td>"+esc(k)+"</td><td class='ok'>"+s.ok+"</td><td class='"+(s.fail?'bad':'')+"'>"+s.fail+"</td></tr>").join('')+"</table>":
+    "<p class='hint'>오늘 호출 기록이 없습니다.</p>";
+  document.getElementById('ai-recent').innerHTML="<table>"+d.recent.map(c=>"<tr><td>"+esc(c.at.slice(11))+"</td><td>"+esc(c.kind)+
+    "</td><td class='"+(c.ok?'ok':'bad')+"'>"+(c.ok?'성공':'실패')+"</td><td style='font-size:0.85em;word-break:break-all;'>"+
+    esc(c.error?c.error.slice(0,120):c.ms+'ms · '+c.model)+"</td></tr>").join('')+"</table>";
+}
+async function switchAI(){const v=document.querySelector('input[name=prof]:checked');if(!v)return;
+  try{await api('ai/switch',{profile:v.value});}catch(e){}refreshAI();}
+async function testAI(){const out=document.getElementById('test-out');out.textContent='테스트 중...';
+  try{const d=await api('ai/test');out.textContent=d.msg;}catch(e){out.textContent='';}refreshAI();}
+async function saveAI(){try{await api('ai/save',{name:document.getElementById('ai-name').value,
+  model:document.getElementById('ai-model').value,key:document.getElementById('ai-key').value,
+  activate:document.getElementById('ai-activate').checked});document.getElementById('ai-key').value='';}catch(e){}refreshAI();}
+async function saveSettings(){try{await api('ai/settings',{allow_draw:document.getElementById('set-draw').checked,
+  summary_on:document.getElementById('set-summary').checked,max_rpm:document.getElementById('set-rpm').value});}catch(e){}refreshAI();}
+
+// ── 아이디 관리 ──
+function userTable(users){return "<table><tr><th>아이디</th><th>전적</th><th>점수</th></tr>"+
+  users.map(u=>"<tr><td>"+esc(u.username)+"</td><td>"+u.wins+"승 "+u.losses+"패</td><td>"+u.points+"</td></tr>").join('')+"</table>";}
+async function refreshUsers(){let d;try{d=await api('users/state');}catch(e){return;}
+  document.getElementById('user-count').textContent='('+d.users.length+'명)';
+  document.getElementById('user-table').innerHTML=userTable(d.users);}
+async function createUser(){try{await api('users/create',{username:document.getElementById('nu').value,pin:document.getElementById('np').value});
+  document.getElementById('nu').value='';document.getElementById('np').value='';}catch(e){}refreshUsers();}
+async function changePin(){try{await api('users/pin',{username:document.getElementById('eu').value,pin:document.getElementById('ep').value});
+  document.getElementById('ep').value='';}catch(e){}refreshUsers();}
+
+// ── 삭제 ──
+async function refreshDanger(){let d;try{d=await api('danger/state');}catch(e){return;}
+  document.getElementById('del-users').innerHTML=d.users.length?"<table>"+d.users.map(u=>
+    "<tr><td><b>"+esc(u.username)+"</b> <span class='hint'>"+u.wins+"승 "+u.losses+"패 · "+u.points+"점</span></td>"+
+    "<td style='text-align:right;'><button class='redline' onclick=\"delUser('"+esc(u.username)+"')\">삭제</button></td></tr>").join('')+"</table>":
+    "<p class='hint'>아이디가 없습니다.</p>";
+  document.getElementById('del-profiles').innerHTML=d.profiles.length?"<table>"+d.profiles.map(p=>
+    "<tr><td><b>"+esc(p.name)+"</b> <span class='hint'>"+esc(p.model)+(p.name===d.active?' · 사용 중':'')+"</span></td>"+
+    "<td style='text-align:right;'><button class='redline' onclick=\"delProfile('"+esc(p.name)+"')\">삭제</button></td></tr>").join('')+"</table>":
+    "<p class='hint'>등록된 키가 없습니다.</p>";}
+async function delUser(n){if(!confirm("'"+n+"' 아이디를 삭제할까요? 되돌릴 수 없습니다."))return;
+  try{await api('danger/delete_user',{username:n});}catch(e){}refreshDanger();}
+async function delProfile(n){if(!confirm("'"+n+"' 키를 삭제할까요?"))return;
+  try{await api('danger/delete_profile',{name:n});}catch(e){}refreshDanger();}
+
+openTab('ops');
 </script>
 </body></html>"""
 
@@ -1432,151 +1747,6 @@ def index():
                                   turn_seconds=TURN_SECONDS, min_length=MIN_MESSAGE_LENGTH)
 
 
-@app.route('/admin', methods=['GET', 'POST'])
-def admin():
-    message = None
-    if request.method == 'POST':
-        code = request.form.get('code', '')
-        action = request.form.get('action', '')
-        if code != ADMIN_CODE:
-            message = "❌ 운영자 코드가 틀렸습니다."
-
-        # ── AI 엔진 전환 / 테스트 ──
-        elif action == 'switch':
-            chosen = request.form.get('profile', TEST_MODE)
-            valid_names = [p['name'] for p in list_profiles()] + [TEST_MODE]
-            if chosen in valid_names:
-                set_setting("active_profile", chosen)
-                message = f"✅ '{chosen}'으로 변경되었습니다."
-            else:
-                message = "❌ 존재하지 않는 프로필입니다."
-        elif action == 'test':
-            ok, detail = test_llm_connection()
-            message = ("✅ 연결 성공! " if ok else "❌ 연결 실패: ") + detail
-        elif action == 'toggle_summary':
-            on = request.form.get('summary_on') == '1'
-            set_setting("summary_enabled", "1" if on else "0")
-            parts = ["발언 요약 " + ("사용" if on else "끔")]
-            raw_rpm = (request.form.get('max_rpm') or '').strip()
-            if raw_rpm:
-                try:
-                    val = max(1, min(60, int(raw_rpm)))
-                    set_setting("ai_max_rpm", str(val))
-                    parts.append(f"분당 상한 {val}회")
-                except ValueError:
-                    parts.append("분당 상한은 숫자로 입력해주세요")
-            message = "✅ " + ", ".join(parts)
-
-        # ── AI 툴 등록 / 수정 / 삭제 ──
-        elif action == 'save_profile':
-            name = (request.form.get('p_name') or '').strip()
-            provider = (request.form.get('p_provider') or 'gemini').strip()
-            model = (request.form.get('p_model') or '').strip()
-            key = (request.form.get('p_key') or '').strip()
-            activate = request.form.get('p_activate') == '1'
-            if not name:
-                message = "❌ 툴 이름을 입력해주세요."
-            elif name == TEST_MODE:
-                message = f"❌ '{TEST_MODE}'는 예약된 이름입니다."
-            elif provider not in PROVIDERS:
-                message = "❌ 지원하지 않는 제공사입니다."
-            else:
-                existing = db_fetchone("SELECT model, api_key FROM ai_profiles WHERE name = %s", (name,))
-                if not model:
-                    model = (existing[0] if existing and existing[0] else DEFAULT_MODELS[provider])
-                if not key:
-                    key = (existing[1] if existing else '') or ''
-                if not key:
-                    message = "❌ API 키를 입력해주세요. (신규 등록은 키가 필요합니다)"
-                else:
-                    upsert_profile(name, provider, model, key)
-                    if activate:
-                        set_setting("active_profile", name)
-                    verb = "수정" if existing else "등록"
-                    message = f"✅ '{name}' {verb} 완료 ({provider}/{model})" + (" — 활성화됨" if activate else "")
-
-        elif action == 'delete_profile':
-            target = (request.form.get('del_name') or '').strip()
-            if not target:
-                message = "❌ 삭제할 툴 이름을 입력해주세요."
-            elif not db_fetchone("SELECT name FROM ai_profiles WHERE name = %s", (target,)):
-                message = f"❌ '{target}' 툴을 찾을 수 없습니다."
-            else:
-                delete_profile(target)
-                message = f"✅ '{target}' 툴을 삭제했습니다."
-
-        # ── 사용자 관리 ──
-        elif action == 'create_user':
-            new_user = (request.form.get('new_username') or '').strip()
-            new_pin = (request.form.get('new_pin') or '').strip()
-            if not new_user or len(new_pin) < 4:
-                message = "❌ 아이디와 4자리 이상 PIN을 입력해주세요."
-            elif db_fetchone("SELECT username FROM users WHERE username = %s", (new_user,)):
-                message = f"❌ '{new_user}' 아이디가 이미 존재합니다."
-            else:
-                db_execute("INSERT INTO users (username, pin_hash) VALUES (%s, %s)", (new_user, hash_pin(new_user, new_pin)))
-                message = f"✅ '{new_user}' 아이디를 생성했습니다."
-        elif action == 'edit_user':
-            target = (request.form.get('edit_username') or '').strip()
-            new_pin = (request.form.get('edit_pin') or '').strip()
-            if not target or len(new_pin) < 4:
-                message = "❌ 아이디와 4자리 이상 새 PIN을 입력해주세요."
-            elif not db_fetchone("SELECT username FROM users WHERE username = %s", (target,)):
-                message = f"❌ '{target}' 아이디를 찾을 수 없습니다."
-            else:
-                db_execute("UPDATE users SET pin_hash = %s WHERE username = %s", (hash_pin(target, new_pin), target))
-                message = f"✅ '{target}'의 PIN을 변경했습니다."
-        elif action == 'delete_user':
-            target = (request.form.get('delete_username') or '').strip()
-            if not db_fetchone("SELECT username FROM users WHERE username = %s", (target,)):
-                message = f"❌ '{target}' 아이디를 찾을 수 없습니다."
-            else:
-                db_execute("DELETE FROM users WHERE username = %s", (target,))
-                message = f"✅ '{target}' 아이디를 삭제했습니다."
-
-    profiles_view = [{"name": p["name"], "provider": p["provider"], "model": p["model"],
-                      "key_ok": bool(p["api_key"].strip()),
-                      "masked": mask_key(p["api_key"])}
-                     for p in list_profiles()]
-    user_rows = db_fetchall("SELECT username, wins, losses, points FROM users ORDER BY username")
-    users_view = [{"username": r[0], "wins": r[1], "losses": r[2], "points": r[3]} for r in user_rows]
-    ai_stats, ai_recent, quota_hit = ai_call_summary()
-    return render_template_string(ADMIN_TEMPLATE, profiles=profiles_view, users=users_view,
-                                  active=get_active_name(), message=message,
-                                  providers=PROVIDERS, default_models=DEFAULT_MODELS,
-                                  ai_stats=ai_stats, ai_recent=ai_recent, quota_hit=quota_hit,
-                                  summary_on=summaries_enabled(),
-                                  rpm_used=current_rpm(), rpm_limit=max_rpm(),
-                                  backup_count=len(backup_profiles()))
-
-
-@app.route('/admin/rooms', methods=['POST'])
-def admin_rooms():
-    data = request.get_json(silent=True) or {}
-    if data.get('code') != ADMIN_CODE:
-        return jsonify({'error': '운영자 코드가 틀렸습니다.'}), 403
-    room_list = []
-    now = time.time()
-    for rid, r in rooms.items():
-        stage_idx = min(r['turn_count'], TOTAL_STAGES - 1)
-        speaker = r['players'][r['current_speaker']]
-        room_list.append({
-            'room_id': rid, 'topic': r['topic'],
-            'stage': 'AI 심사 중' if r.get('judging') else STAGES[stage_idx],
-            'stage_index': stage_idx, 'total_stages': TOTAL_STAGES,
-            'turns': len(r['logs']),
-            'elapsed_min': int((now - r.get('started_at', now)) // 60),
-            'speaker': speaker['username'],
-            'players': [{
-                'username': p['username'], 'alias': p['alias'], 'side': p['side'],
-                'connected': p.get('connected', True),
-                'speaking': (p is speaker) and not r.get('judging'),
-            } for p in r['players']],
-        })
-    room_list.sort(key=lambda x: -x['turns'])
-    return jsonify({'rooms': room_list})
-
-
 @app.route('/history')
 def history():
     rows = db_fetchall("SELECT played_at, topic, player_a, player_b, side_a, side_b, log_json, winner, reason, engine "
@@ -1618,6 +1788,528 @@ def ranking():
     return render_template_string(RANKING_TEMPLATE, table=table, totals=totals)
 
 
+# ═════════════════════════════════════════════
+# 관리자 인증 — 탭 단위 잠금
+# 탭에 들어갈 때 코드를 한 번 입력하면 그 탭 안에서는 자유롭게 작업한다.
+# 탭을 나가면(다른 탭으로 이동·새로고침·창 닫기) 잠기고, 다시 들어올 때 코드를 묻는다.
+# ═════════════════════════════════════════════
+ADMIN_TABS = {"ops": "대회 운영", "ai": "AI 설정", "users": "아이디 관리", "danger": "삭제"}
+ADMIN_IDLE_SECONDS = 30 * 60      # 탭을 열어둔 채 30분간 아무 요청이 없으면 잠김
+admin_tokens = {}                 # token -> {"tab", "last"}
+_login_fails = {}                 # ip -> [실패 횟수, 잠금 해제 시각]
+LOCK_AFTER_FAILS = 5
+LOCK_SECONDS = 300
+
+
+def _client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return (fwd.split(",")[0].strip() if fwd else request.remote_addr) or "?"
+
+
+def _check_admin_code(code):
+    return hmac.compare_digest((code or "").encode(), ADMIN_CODE.encode())
+
+
+def _token_ok(token, tab):
+    info = admin_tokens.get(token or "")
+    if not info or info["tab"] != tab:
+        return False
+    if time.time() - info["last"] > ADMIN_IDLE_SECONDS:
+        admin_tokens.pop(token, None)
+        return False
+    info["last"] = time.time()
+    return True
+
+
+def admin_api(tab):
+    """해당 탭의 잠금을 푼 토큰이 있어야 실행된다."""
+    def deco(fn):
+        def wrapper(*args, **kwargs):
+            if not _token_ok(request.headers.get("X-Admin-Token"), tab):
+                return jsonify({"locked": True, "error": "잠긴 탭입니다. 코드를 다시 입력해주세요."}), 401
+            try:
+                return fn(request.get_json(silent=True) or {}, *args, **kwargs)
+            except Exception as e:
+                print(f"[관리자 API 오류] {fn.__name__}: {type(e).__name__}: {e}")
+                return jsonify({"error": f"처리 중 오류: {type(e).__name__}: {e}"}), 500
+        wrapper.__name__ = f"admin_{tab}_{fn.__name__}"
+        return wrapper
+    return deco
+
+
+@app.route('/admin')
+def admin():
+    if ADMIN_CODE == "1234":
+        print("[경고] DEBATE_ADMIN_CODE가 설정되지 않아 기본 코드(1234)를 쓰고 있습니다.")
+    return render_template_string(ADMIN_TEMPLATE, tabs=ADMIN_TABS)
+
+
+@app.route('/admin/api/unlock', methods=['POST'])
+def admin_unlock():
+    data = request.get_json(silent=True) or {}
+    tab = data.get("tab")
+    if tab not in ADMIN_TABS:
+        return jsonify({"error": "알 수 없는 탭입니다."}), 400
+    ip = _client_ip()
+    fails, until = _login_fails.get(ip, [0, 0])
+    if until > time.time():
+        return jsonify({"error": f"코드를 여러 번 틀려 {int(until - time.time())}초 동안 잠겼습니다."}), 429
+    if not _check_admin_code(data.get("code")):
+        fails += 1
+        _login_fails[ip] = [0, time.time() + LOCK_SECONDS] if fails >= LOCK_AFTER_FAILS else [fails, 0]
+        left = LOCK_AFTER_FAILS - fails
+        return jsonify({"error": "코드가 틀렸습니다." + (f" ({left}번 더 틀리면 5분 잠김)" if left > 0 else " 5분간 잠깁니다.")}), 403
+    _login_fails.pop(ip, None)
+    # 오래된 토큰 정리
+    now = time.time()
+    for t in [t for t, v in admin_tokens.items() if now - v["last"] > ADMIN_IDLE_SECONDS]:
+        admin_tokens.pop(t, None)
+    token = secrets.token_urlsafe(24)
+    admin_tokens[token] = {"tab": tab, "last": now}
+    return jsonify({"token": token, "tab": tab})
+
+
+@app.route('/admin/api/lock', methods=['POST'])
+def admin_lock():
+    data = request.get_json(silent=True) or {}
+    admin_tokens.pop(data.get("token") or request.headers.get("X-Admin-Token") or "", None)
+    return jsonify({"ok": True})
+
+
+# ─────────────────────────────────────────────
+# 관리자 — 대회 운영 탭
+# ─────────────────────────────────────────────
+def auto_match_on():
+    return get_setting("auto_match", "1") != "0"
+
+
+def get_reservations():
+    try:
+        return json.loads(get_setting("reservations", "[]") or "[]")
+    except Exception:
+        return []
+
+
+def set_reservations(lst):
+    set_setting("reservations", json.dumps(lst, ensure_ascii=False))
+
+
+def reserved_usernames():
+    names = set()
+    for r in get_reservations():
+        names.add(r["a"])
+        names.add(r["b"])
+    return names
+
+
+def room_view(rid, r):
+    now = time.time()
+    stage_idx = min(r['turn_count'], TOTAL_STAGES - 1)
+    if r.get('judging'):
+        stage = 'AI 심사 중'
+    elif r['turn_count'] == 0:
+        stage = '입론 (동시 작성)'
+    else:
+        stage = STAGES[stage_idx]
+    speaker = r['players'][r['current_speaker']]
+    return {
+        'room_id': rid, 'topic': r['topic'], 'stage': stage,
+        'stage_index': stage_idx, 'total_stages': TOTAL_STAGES,
+        'turns': len(r['logs']),
+        'elapsed_min': int((now - r.get('started_at', now)) // 60),
+        'seconds_left': seconds_left(r),
+        'paused': bool(r.get('paused_at')),
+        'players': [{
+            'username': p['username'], 'alias': p['alias'], 'side': p['side'],
+            'connected': p.get('connected', True),
+            'absent_sec': (int(now - p['disconnect_at'])
+                           if not p.get('connected', True) and p.get('disconnect_at') else 0),
+            'speaking': (not r.get('judging')) and (
+                (r['turn_count'] == 0 and r['openings'][i] is None) or
+                (r['turn_count'] > 0 and p is speaker)),
+            'opening_done': r['turn_count'] == 0 and r['openings'][i] is not None,
+        } for i, p in enumerate(r['players'])],
+    }
+
+
+def pending_debates():
+    rows = db_fetchall("SELECT id, played_at, topic, player_a, player_b, side_a, side_b, winner, "
+                       "reason, pending_json FROM debates WHERE winner IN ('판정대기','심사실패') "
+                       "ORDER BY id DESC LIMIT 20")
+    out = []
+    for r in rows:
+        try:
+            pend = json.loads(r[9]) if r[9] else {}
+        except Exception:
+            pend = {}
+        out.append({"id": r[0], "played_at": r[1], "topic": r[2],
+                    "player_a": r[3], "player_b": r[4], "side_a": r[5], "side_b": r[6],
+                    "winner": r[7], "reason": r[8], "pending": pend,
+                    "rejudging": r[0] in _rejudging})
+    return out
+
+
+@app.route('/admin/api/ops/state', methods=['POST'])
+@admin_api("ops")
+def ops_state(data):
+    now = time.time()
+    reserved = reserved_usernames()
+    return jsonify({
+        "auto_match": auto_match_on(),
+        "waiting": [{"username": p["username"], "wait_sec": int(now - p.get("since", now)),
+                     "reserved": p["username"] in reserved} for p in waiting_pool],
+        "reservations": get_reservations(),
+        "rooms": sorted([room_view(rid, r) for rid, r in rooms.items()], key=lambda x: -x['turns']),
+        "pending": pending_debates(),
+        "absent_alert": ABSENT_ALERT_SECONDS,
+    })
+
+
+@app.route('/admin/api/ops/auto', methods=['POST'])
+@admin_api("ops")
+def ops_auto(data):
+    on = bool(data.get("on"))
+    set_setting("auto_match", "1" if on else "0")
+    notify_waiting_status()
+    if on:
+        try_match()
+    return jsonify({"ok": True, "msg": "자동(랜덤) 매칭 " + ("켜짐" if on else "꺼짐")})
+
+
+SIDE_MODES = ("random", "a_pro", "a_con")
+
+
+@app.route('/admin/api/ops/pair', methods=['POST'])
+@admin_api("ops")
+def ops_pair(data):
+    a, b = (data.get("a") or "").strip(), (data.get("b") or "").strip()
+    side = data.get("side") if data.get("side") in SIDE_MODES else "random"
+    topic = (data.get("topic") or "").strip()
+    if not a or not b or a == b:
+        return jsonify({"error": "서로 다른 두 사람을 골라주세요."}), 400
+    pa = next((p for p in waiting_pool if p["username"] == a), None)
+    pb = next((p for p in waiting_pool if p["username"] == b), None)
+    if not pa or not pb:
+        return jsonify({"error": "두 사람 모두 대기실에 있어야 합니다. (토론 매칭 시작을 누른 상태)"}), 400
+    waiting_pool.remove(pa)
+    waiting_pool.remove(pb)
+    # 지정 매칭으로 붙은 두 사람이 다른 예약에 걸려 있으면 그 예약은 지운다
+    set_reservations([r for r in get_reservations() if not ({r["a"], r["b"]} & {a, b})])
+    if not launch_debate(pa, pb, side, topic):
+        return jsonify({"error": "방을 만들지 못해 두 사람을 대기실로 돌려보냈습니다."}), 500
+    return jsonify({"ok": True, "msg": f"{a} vs {b} 매칭 완료"})
+
+
+@app.route('/admin/api/ops/reserve', methods=['POST'])
+@admin_api("ops")
+def ops_reserve(data):
+    a, b = (data.get("a") or "").strip(), (data.get("b") or "").strip()
+    side = data.get("side") if data.get("side") in SIDE_MODES else "random"
+    topic = (data.get("topic") or "").strip()
+    if not a or not b or a == b:
+        return jsonify({"error": "서로 다른 두 아이디를 입력해주세요."}), 400
+    for name in (a, b):
+        if not db_fetchone("SELECT username FROM users WHERE username = %s", (name,)):
+            return jsonify({"error": f"'{name}' 아이디가 없습니다."}), 400
+    lst = get_reservations()
+    busy = reserved_usernames()
+    if a in busy or b in busy:
+        return jsonify({"error": "이미 다른 예약에 들어 있는 사람이 있습니다. 기존 예약을 먼저 지워주세요."}), 400
+    lst.append({"id": uuid.uuid4().hex[:8], "a": a, "b": b, "side": side, "topic": topic})
+    set_reservations(lst)
+    notify_waiting_status()
+    try_match()
+    return jsonify({"ok": True, "msg": f"예약 등록: {a} vs {b} — 둘 다 대기실에 오면 자동으로 시작"})
+
+
+@app.route('/admin/api/ops/unreserve', methods=['POST'])
+@admin_api("ops")
+def ops_unreserve(data):
+    rid = data.get("id")
+    set_reservations([r for r in get_reservations() if r["id"] != rid])
+    notify_waiting_status()
+    try_match()
+    return jsonify({"ok": True, "msg": "예약을 지웠습니다."})
+
+
+@app.route('/admin/api/ops/stop', methods=['POST'])
+@admin_api("ops")
+def ops_stop(data):
+    room_id = data.get("room_id")
+    room = rooms.get(room_id)
+    if not room:
+        return jsonify({"error": "이미 끝난 토론입니다."}), 400
+    if room.get("judging"):
+        return jsonify({"error": "AI 심사 중이라 중단할 수 없습니다. 잠시만 기다려주세요."}), 400
+    end_without_result(room_id, "운영자가 토론을 중단했습니다 (승패 미기록 — 재경기 필요)")
+    return jsonify({"ok": True, "msg": "토론을 중단했습니다. 두 사람은 대기 화면으로 돌아갑니다."})
+
+
+@app.route('/admin/api/ops/resolve', methods=['POST'])
+@admin_api("ops")
+def ops_resolve(data):
+    """'토론 의지 없음' 판정 대기 건 처리. action: forfeit_pro / forfeit_con / dismiss"""
+    did = data.get("id")
+    action = data.get("action")
+    row = db_fetchone("SELECT player_a, player_b, side_a, side_b, winner, reason, pending_json "
+                      "FROM debates WHERE id = %s", (did,))
+    if not row or row[4] != "판정대기":
+        return jsonify({"error": "이미 처리됐거나 없는 기록입니다."}), 400
+    pa, pb, sa, sb, _, reason, pend_raw = row
+    pend = json.loads(pend_raw or "{}")
+    by_side = {sa: pa, sb: pb}
+    reveal = pend.get("reveal", "")
+    if action in ("forfeit_pro", "forfeit_con"):
+        loser_side = "찬성" if action == "forfeit_pro" else "반대"
+        winner_side = "반대" if loser_side == "찬성" else "찬성"
+        record_win_loss(by_side[winner_side], by_side[loser_side])
+        headline = (f"{by_side[loser_side]}({loser_side}) 토론 의지 없음 → "
+                    f"{by_side[winner_side]}({winner_side}) 몰수승 (운영자 승인)")
+        new_reason = (f"{headline}\nAI 지적: {pend.get('no_will_reason','')}\n\n"
+                      f"[참고: AI 원래 판정]\n{pend.get('text','')}\n\n{reveal}")
+        db_execute("UPDATE debates SET winner = %s, reason = %s, pending_json = NULL WHERE id = %s",
+                   ("몰수", new_reason, did))
+        return jsonify({"ok": True, "msg": headline})
+    if action == "dismiss":
+        ai_winner = pend.get("winner")
+        if ai_winner in by_side:
+            loser = sb if ai_winner == sa else sa
+            record_win_loss(by_side[ai_winner], by_side[loser])
+        new_reason = f"{pend.get('text','')}\n(토론 의지 없음 지적은 운영자가 기각)\n\n{reveal}"
+        db_execute("UPDATE debates SET winner = %s, reason = %s, pending_json = NULL WHERE id = %s",
+                   (ai_winner or "무승부", new_reason, did))
+        return jsonify({"ok": True, "msg": f"기각 — AI 판정대로 {ai_winner} 승리 적용"})
+    return jsonify({"error": "알 수 없는 처리입니다."}), 400
+
+
+_rejudging = set()
+
+
+@app.route('/admin/api/ops/rejudge', methods=['POST'])
+@admin_api("ops")
+def ops_rejudge(data):
+    did = data.get("id")
+    row = db_fetchone("SELECT winner FROM debates WHERE id = %s", (did,))
+    if not row or row[0] != "심사실패":
+        return jsonify({"error": "심사실패 기록만 다시 심사할 수 있습니다."}), 400
+    if did in _rejudging:
+        return jsonify({"error": "이미 다시 심사하는 중입니다."}), 400
+    _rejudging.add(did)
+    socketio.start_background_task(rejudge_in_background, did)
+    return jsonify({"ok": True, "msg": "다시 심사를 시작했습니다. 잠시 후 목록에 반영됩니다."})
+
+
+def rejudge_in_background(did):
+    try:
+        row = db_fetchone("SELECT topic, player_a, player_b, side_a, side_b, log_json, pending_json "
+                          "FROM debates WHERE id = %s", (did,))
+        if not row:
+            return
+        topic, pa, pb, sa, sb, log_json, pend_raw = row
+        logs = json.loads(log_json or "[]")
+        reveal = (json.loads(pend_raw or "{}")).get("reveal", "")
+        result = judge_debate(topic, logs)
+        winner, reason, pending = settle_result(result, (pa, sa), (pb, sb), reveal)
+        db_execute("UPDATE debates SET winner = %s, reason = %s, pending_json = %s WHERE id = %s",
+                   (winner, reason, json.dumps(pending, ensure_ascii=False) if pending else None, did))
+        socketio.emit('admin_alert', {'msg': f"재심사 완료 — {topic}: {winner}"}, room="admins")
+    finally:
+        _rejudging.discard(did)
+
+
+# ─────────────────────────────────────────────
+# 관리자 — AI 설정 탭
+# ─────────────────────────────────────────────
+@app.route('/admin/api/ai/state', methods=['POST'])
+@admin_api("ai")
+def ai_state(data):
+    stats, recent, billing_hit, rate_hit = ai_call_summary()
+    return jsonify({
+        "active": get_active_name(),
+        "profiles": [{"name": p["name"], "model": p["model"],
+                      "key_ok": bool(p["api_key"].strip()), "masked": mask_key(p["api_key"]),
+                      "redirect": _model_redirect.get(p["model"], "")} for p in list_profiles()],
+        "default_model": DEFAULT_MODEL,
+        "stats": stats, "recent": recent, "billing_hit": billing_hit, "rate_hit": rate_hit,
+        "summary_on": summaries_enabled(), "allow_draw": draws_allowed(),
+        "rpm_used": current_rpm(), "rpm_limit": max_rpm(),
+        "backup_count": len(backup_profiles()),
+    })
+
+
+@app.route('/admin/api/ai/switch', methods=['POST'])
+@admin_api("ai")
+def ai_switch(data):
+    chosen = data.get("profile") or TEST_MODE
+    if chosen not in [p['name'] for p in list_profiles()] + [TEST_MODE]:
+        return jsonify({"error": "존재하지 않는 AI입니다."}), 400
+    set_setting("active_profile", chosen)
+    if chosen != TEST_MODE:
+        socketio.start_background_task(refill_topic_cache)
+    return jsonify({"ok": True, "msg": f"'{chosen}'(으)로 변경했습니다."})
+
+
+@app.route('/admin/api/ai/test', methods=['POST'])
+@admin_api("ai")
+def ai_test(data):
+    ok, detail = test_llm_connection()
+    return jsonify({"ok": ok, "msg": ("✅ 연결 성공! " if ok else "❌ 연결 실패: ") + detail})
+
+
+@app.route('/admin/api/ai/save', methods=['POST'])
+@admin_api("ai")
+def ai_save(data):
+    name = (data.get("name") or "").strip()
+    model = (data.get("model") or "").strip()
+    key = (data.get("key") or "").strip()
+    if not name:
+        return jsonify({"error": "이름을 입력해주세요."}), 400
+    if name == TEST_MODE:
+        return jsonify({"error": f"'{TEST_MODE}'는 예약된 이름입니다."}), 400
+    existing = db_fetchone("SELECT model, api_key FROM ai_profiles WHERE name = %s", (name,))
+    model = model or (existing[0] if existing and existing[0] else DEFAULT_MODEL)
+    key = key or ((existing[1] if existing else '') or '')
+    if not key:
+        return jsonify({"error": "API 키를 입력해주세요. (신규 등록은 키가 필요합니다)"}), 400
+    upsert_profile(name, PROVIDER, model, key)
+    _model_redirect.pop(model, None)
+    if data.get("activate"):
+        set_setting("active_profile", name)
+        socketio.start_background_task(refill_topic_cache)
+    return jsonify({"ok": True, "msg": f"'{name}' {'수정' if existing else '등록'} 완료 ({model})"
+                    + (" — 활성화됨" if data.get("activate") else "")})
+
+
+@app.route('/admin/api/ai/settings', methods=['POST'])
+@admin_api("ai")
+def ai_settings(data):
+    parts = []
+    if "summary_on" in data:
+        set_setting("summary_enabled", "1" if data["summary_on"] else "0")
+        parts.append("발언 요약 " + ("사용" if data["summary_on"] else "끔"))
+    if "allow_draw" in data:
+        set_setting("allow_draw", "1" if data["allow_draw"] else "0")
+        parts.append("무승부 " + ("허용" if data["allow_draw"] else "금지(토너먼트용)"))
+    if str(data.get("max_rpm") or "").strip():
+        try:
+            val = max(1, min(1000, int(data["max_rpm"])))
+            set_setting("ai_max_rpm_v2", str(val))
+            parts.append(f"분당 상한 {val}회")
+        except (TypeError, ValueError):
+            return jsonify({"error": "분당 상한은 숫자로 입력해주세요."}), 400
+    return jsonify({"ok": True, "msg": "저장: " + ", ".join(parts) if parts else "변경 사항 없음"})
+
+
+# ─────────────────────────────────────────────
+# 관리자 — 아이디 관리 / 삭제 탭
+# ─────────────────────────────────────────────
+def users_list():
+    rows = db_fetchall("SELECT username, wins, losses, points FROM users ORDER BY username")
+    return [{"username": r[0], "wins": r[1], "losses": r[2], "points": r[3]} for r in rows]
+
+
+@app.route('/admin/api/users/state', methods=['POST'])
+@admin_api("users")
+def users_state(data):
+    return jsonify({"users": users_list()})
+
+
+@app.route('/admin/api/users/create', methods=['POST'])
+@admin_api("users")
+def users_create(data):
+    new_user = (data.get("username") or "").strip()
+    new_pin = (data.get("pin") or "").strip()
+    if not new_user or len(new_pin) < 4:
+        return jsonify({"error": "아이디와 4자리 이상 PIN을 입력해주세요."}), 400
+    if db_fetchone("SELECT username FROM users WHERE username = %s", (new_user,)):
+        return jsonify({"error": f"'{new_user}' 아이디가 이미 존재합니다."}), 400
+    db_execute("INSERT INTO users (username, pin_hash) VALUES (%s, %s)", (new_user, hash_pin(new_user, new_pin)))
+    return jsonify({"ok": True, "msg": f"'{new_user}' 생성 완료"})
+
+
+@app.route('/admin/api/users/pin', methods=['POST'])
+@admin_api("users")
+def users_pin(data):
+    target = (data.get("username") or "").strip()
+    new_pin = (data.get("pin") or "").strip()
+    if not target or len(new_pin) < 4:
+        return jsonify({"error": "아이디와 4자리 이상 새 PIN을 입력해주세요."}), 400
+    if not db_fetchone("SELECT username FROM users WHERE username = %s", (target,)):
+        return jsonify({"error": f"'{target}' 아이디를 찾을 수 없습니다."}), 400
+    db_execute("UPDATE users SET pin_hash = %s WHERE username = %s", (hash_pin(target, new_pin), target))
+    return jsonify({"ok": True, "msg": f"'{target}'의 PIN을 변경했습니다."})
+
+
+@app.route('/admin/api/danger/state', methods=['POST'])
+@admin_api("danger")
+def danger_state(data):
+    return jsonify({"users": users_list(),
+                    "profiles": [{"name": p["name"], "model": p["model"]} for p in list_profiles()],
+                    "active": get_active_name()})
+
+
+@app.route('/admin/api/danger/delete_user', methods=['POST'])
+@admin_api("danger")
+def danger_delete_user(data):
+    target = (data.get("username") or "").strip()
+    if not db_fetchone("SELECT username FROM users WHERE username = %s", (target,)):
+        return jsonify({"error": f"'{target}' 아이디를 찾을 수 없습니다."}), 400
+    if target in user_to_room:
+        return jsonify({"error": "토론 중인 아이디는 삭제할 수 없습니다."}), 400
+    db_execute("DELETE FROM users WHERE username = %s", (target,))
+    return jsonify({"ok": True, "msg": f"'{target}' 삭제 완료"})
+
+
+@app.route('/admin/api/danger/delete_profile', methods=['POST'])
+@admin_api("danger")
+def danger_delete_profile(data):
+    target = (data.get("name") or "").strip()
+    if not db_fetchone("SELECT name FROM ai_profiles WHERE name = %s", (target,)):
+        return jsonify({"error": f"'{target}'을(를) 찾을 수 없습니다."}), 400
+    delete_profile(target)
+    return jsonify({"ok": True, "msg": f"'{target}' 삭제 완료"})
+
+
+@socketio.on('admin_watch')
+def handle_admin_watch(data):
+    data = data or {}
+    if not _token_ok(data.get('token'), "ops"):
+        emit('admin_locked', {})
+        return
+    join_room("admins")
+    room_id = data.get('room_id')
+    if not room_id:
+        return
+    room = rooms.get(room_id)
+    if not room:
+        emit('error_msg', {'msg': '존재하지 않거나 이미 종료된 토론입니다.'})
+        return
+    join_room(f"watch_{room_id}")
+    history_logs = [{'stage': l['stage'], 'side': l['side'], 'message': l['text']} for l in room['logs']]
+    emit('admin_history', {'room_id': room_id, 'topic': room['topic'], 'logs': history_logs})
+
+
+# ═════════════════════════════════════════════
+# 토론 진행
+# ═════════════════════════════════════════════
+def seconds_left(room):
+    """남은 시간. 누가 끊겨 시계가 멈춰 있으면 멈춘 시점 기준."""
+    ref = room.get('paused_at') or time.time()
+    return max(0, int(round(room['deadline'] - ref)))
+
+
+def pause_clock(room):
+    if not room.get('paused_at'):
+        room['paused_at'] = time.time()
+
+
+def resume_clock(room):
+    """모두 돌아왔으면 멈춘 시간만큼 마감을 미룬다."""
+    if room.get('paused_at') and all(p.get('connected', True) for p in room['players']):
+        room['deadline'] += time.time() - room['paused_at']
+        room['paused_at'] = None
+
+
 def close_room(room_id):
     room = rooms.pop(room_id, None)
     if room:
@@ -1625,16 +2317,19 @@ def close_room(room_id):
             sid_to_room.pop(p['sid'], None)
             user_to_room.pop(p['username'], None)
 
+
 def make_reveal_text(room):
     a, b = room['players'][0], room['players'][1]
     return f"🎭 정체 공개!\n{a['alias']} ({a['side']}) = {a['username']}\n{b['alias']} ({b['side']}) = {b['username']}"
+
 
 def who(player):
     """기록에 남길 이름 표기 — 아이디(찬성/반대)"""
     return f"{player['username']}({player['side']})"
 
+
 def end_by_surrender(room_id, loser, winner):
-    """항복 — 유일하게 몰수패가 기록되는 경우."""
+    """항복 — 본인이 직접 버튼을 누른 경우에만 몰수패."""
     room = rooms.get(room_id)
     if not room:
         return
@@ -1650,20 +2345,17 @@ def end_by_surrender(room_id, loser, winner):
     close_room(room_id)
 
 
-def end_without_result(room_id, absent, stayer):
-    """
-    접속이 끊긴 채 돌아오지 않아 토론을 끝낸다.
-    승패는 기록하지 않는다 — 인터넷 문제로 지는 일이 없도록.
-    """
+def end_without_result(room_id, headline):
+    """승패 없이 토론을 끝낸다 (운영자 중단). 두 사람에게 알리고 기록은 '중단'으로 남긴다."""
     room = rooms.get(room_id)
     if not room:
         return
     reveal = make_reveal_text(room)
-    headline = f"{who(absent)} 접속 끊김으로 토론 중단 (승패 미기록)"
     save_debate(room['topic'], room['players'][0]['username'], room['players'][1]['username'],
                 room['players'][0]['side'], room['players'][1]['side'],
                 room['logs'], "중단", f"{headline}\n\n{reveal}")
-    socketio.emit('debate_aborted', {'reveal': reveal, 'headline': headline}, room=stayer['sid'])
+    for p in room['players']:
+        socketio.emit('debate_aborted', {'reveal': reveal, 'headline': headline}, room=p['sid'])
     socketio.emit('admin_end', {'room_id': room_id, 'result': f"{headline}\n\n{reveal}"},
                   room=f"watch_{room_id}")
     close_room(room_id)
@@ -1683,20 +2375,78 @@ def handle_surrender(data):
     end_by_surrender(room_id, me, opp)
 
 
+def _take_over_session(username, new_sid):
+    """
+    같은 아이디가 새로 접속하면 새 접속을 살린다 (새로고침·기기 변경·네트워크 전환).
+    예전 접속은 조용히 떼어내고, 그 화면에는 '다른 곳에서 접속됨'을 띄운다.
+    """
+    for old_sid in [s for s, u in sid_to_user.items() if u == username and s != new_sid]:
+        sid_to_user.pop(old_sid, None)
+        sid_to_room.pop(old_sid, None)
+        waiting_pool[:] = [p for p in waiting_pool if p['sid'] != old_sid]
+        socketio.emit('kicked', {}, room=old_sid)
+    sid_to_user[new_sid] = username
+
+
+def _profile_payload(username, token):
+    stats = get_user_stats(username) or {"wins": 0, "losses": 0, "points": 0, "rank": "-"}
+    return {'username': username, 'resume_token': token,
+            'wins': stats['wins'], 'losses': stats['losses'],
+            'points': stats['points'], 'rank': stats['rank']}
+
+
+def _seat_in_room(username, sid):
+    """진행 중인 토론이 있으면 그 자리에 다시 앉히고 True."""
+    room_id = user_to_room.get(username)
+    room = rooms.get(room_id) if room_id else None
+    if not room:
+        return False
+    me = next((p for p in room['players'] if p['username'] == username), None)
+    opp = next((p for p in room['players'] if p['username'] != username), None)
+    if not me or not opp:
+        return False
+    my_index = room['players'].index(me)
+    if me['sid'] != sid:
+        sid_to_room.pop(me['sid'], None)
+    me['sid'] = sid
+    me['connected'] = True
+    me.pop('disconnect_at', None)
+    sid_to_room[sid] = room_id
+    socketio.server.enter_room(sid, room_id, namespace='/')
+    resume_clock(room)
+
+    opening = room['turn_count'] == 0
+    stage_idx = min(room['turn_count'], TOTAL_STAGES - 1)
+    socketio.emit('resumed', {
+        'room_id': room_id, 'topic': room['topic'],
+        'my_alias': me['alias'], 'opp_alias': opp['alias'],
+        'my_side': me['side'], 'opp_side': opp['side'],
+        'stage': STAGES[stage_idx], 'stage_index': stage_idx, 'total_stages': TOTAL_STAGES,
+        'opening': opening,
+        'my_opening_done': opening and room['openings'][my_index] is not None,
+        'opp_opening_done': opening and room['openings'][1 - my_index] is not None,
+        'your_turn': (not opening) and room['current_speaker'] == my_index,
+        'judging': bool(room.get('judging')),
+        'seconds_left': seconds_left(room),
+        'opp_connected': opp.get('connected', True),
+        'speaker_alias': room['players'][room['current_speaker']]['alias'],
+        'speaker_side': room['players'][room['current_speaker']]['side'],
+        'criteria': [{'stage': s, 'desc': d} for s, d in JUDGE_CRITERIA],
+        'min_length': MIN_MESSAGE_LENGTH,
+        'logs': [{'sender': (me['alias'] if l['side'] == me['side'] else opp['alias']),
+                  'side': l['side'], 'stage': l['stage'], 'message': l['text']} for l in room['logs']],
+    }, room=sid)
+    if opp.get('connected', True):
+        socketio.emit('opponent_reconnected', {'seconds_left': seconds_left(room)}, room=opp['sid'])
+    return True
+
+
 @socketio.on('login')
 def handle_login(data):
     username = (data.get('username') or '').strip()
     pin = (data.get('pin') or '').strip()
     if not username or len(pin) < 4:
         emit('error_msg', {'msg': '아이디를 입력하고 PIN은 4자리 이상으로 해주세요.'})
-        return
-    # 이미 접속 중이더라도, 끊긴 채로 남아 있는 유령 세션은 정리하고 통과시킨다
-    stale = [s for s, u in sid_to_user.items() if u == username and s != request.sid]
-    for s in stale:
-        if s not in sid_to_room:
-            sid_to_user.pop(s, None)
-    if username in sid_to_user.values():
-        emit('error_msg', {'msg': '이 아이디는 이미 다른 기기에서 접속 중입니다.'})
         return
     row = db_fetchone("SELECT pin_hash FROM users WHERE username = %s", (username,))
     if not row:
@@ -1705,13 +2455,38 @@ def handle_login(data):
     if row[0] != hash_pin(username, pin):
         emit('error_msg', {'msg': 'PIN이 틀렸습니다.'})
         return
-    sid_to_user[request.sid] = username
+    _take_over_session(username, request.sid)
     token = uuid.uuid4().hex
     resume_tokens[token] = username
-    stats = get_user_stats(username)
-    emit('login_ok', {'username': username, 'resume_token': token,
-                      'wins': stats['wins'], 'losses': stats['losses'],
-                      'points': stats['points'], 'rank': stats['rank']})
+    emit('login_ok', _profile_payload(username, token))
+    _seat_in_room(username, request.sid)   # 토론 도중 튕겨서 다시 로그인한 경우 바로 복귀
+
+
+@socketio.on('resume')
+def handle_resume(data):
+    """새로고침·재접속. 토론 중이면 원래 자리로, 아니면 로그인 상태로 복귀."""
+    token = (data or {}).get('token')
+    username = resume_tokens.get(token)
+    if not username:
+        emit('resume_failed', {})
+        return
+    _take_over_session(username, request.sid)
+    if not _seat_in_room(username, request.sid):
+        emit('login_ok', _profile_payload(username, token))
+
+
+def notify_waiting_status():
+    """대기 중인 사람들에게 지금 어떤 방식으로 매칭되는지 알려준다."""
+    reserved = reserved_usernames()
+    auto = auto_match_on()
+    for p in waiting_pool:
+        if p['username'] in reserved:
+            msg = '운영자가 지정한 상대를 기다리는 중... 상대가 들어오면 바로 시작합니다.'
+        elif auto:
+            msg = f'대기열에서 상대방 매칭을 기다리는 중... (대기 {len(waiting_pool)}명)'
+        else:
+            msg = '대기실에 입장했습니다. 운영자가 대진을 배정하면 바로 시작합니다.'
+        socketio.emit('status', {'msg': msg}, room=p['sid'])
 
 
 @socketio.on('join_queue')
@@ -1721,72 +2496,97 @@ def handle_join_queue(data):
     if not username:
         emit('error_msg', {'msg': '먼저 로그인해주세요.'})
         return
-    if any(p['sid'] == user_sid for p in waiting_pool) or user_sid in sid_to_room:
+    if user_sid in sid_to_room or username in user_to_room:
         return
-    waiting_pool.append({"sid": user_sid, "username": username})
-    emit('status', {'msg': f'대기열에서 상대방 매칭을 기다리는 중... (대기 {len(waiting_pool)}명)'})
-    if len(waiting_pool) >= 2:
-        p1 = waiting_pool.pop(random.randint(0, len(waiting_pool) - 1))
-        p2 = waiting_pool.pop(random.randint(0, len(waiting_pool) - 1))
-        try:
-            start_debate(p1, p2)
-        except Exception as e:
-            # 방을 못 만들면 두 사람을 대기열로 되돌린다 (사라져서 영영 매칭 안 되는 것 방지)
-            print(f"[매칭 실패] {type(e).__name__}: {e}")
-            waiting_pool.extend([p1, p2])
-            for p in (p1, p2):
-                socketio.emit('error_msg',
-                              {'msg': '매칭 중 문제가 생겨 대기열로 돌아갔습니다. 잠시 후 자동으로 다시 시도됩니다.'},
-                              room=p['sid'])
-                socketio.emit('rejoin_queue', {}, room=p['sid'])
+    if any(p['username'] == username for p in waiting_pool):
+        return
+    waiting_pool.append({"sid": user_sid, "username": username, "since": time.time()})
+    notify_waiting_status()
+    try_match()
 
 
-def start_debate(p1, p2):
-        title_a, title_b = random.sample(ALIAS_POOL, 2)
+def try_match():
+    """
+    1) 예약 매칭: 예약된 두 사람이 모두 대기실에 있으면 바로 시작.
+    2) 자동 매칭(켜져 있을 때만): 예약이 없는 사람끼리 랜덤으로.
+    """
+    lst = get_reservations()
+    remaining = []
+    changed = False
+    for r in lst:
+        pa = next((p for p in waiting_pool if p['username'] == r['a']), None)
+        pb = next((p for p in waiting_pool if p['username'] == r['b']), None)
+        if pa and pb:
+            waiting_pool.remove(pa)
+            waiting_pool.remove(pb)
+            changed = True
+            launch_debate(pa, pb, r.get('side', 'random'), r.get('topic', ''))
+        else:
+            remaining.append(r)
+    if changed:
+        set_reservations(remaining)
+
+    if auto_match_on():
+        reserved = {n for r in remaining for n in (r['a'], r['b'])}
+        free = [p for p in waiting_pool if p['username'] not in reserved]
+        while len(free) >= 2:
+            p1 = free.pop(random.randrange(len(free)))
+            p2 = free.pop(random.randrange(len(free)))
+            waiting_pool.remove(p1)
+            waiting_pool.remove(p2)
+            launch_debate(p1, p2)
+    notify_waiting_status()
+
+
+def launch_debate(p1, p2, side_mode="random", topic=""):
+    """방을 만든다. 실패하면 두 사람을 대기실로 되돌린다."""
+    try:
+        start_debate(p1, p2, side_mode, topic)
+        return True
+    except Exception as e:
+        print(f"[매칭 실패] {type(e).__name__}: {e}")
+        for p in (p1, p2):
+            if p not in waiting_pool:
+                waiting_pool.append(p)
+            socketio.emit('error_msg',
+                          {'msg': '매칭 중 문제가 생겨 대기실로 돌아갔습니다. 잠시 후 다시 시도됩니다.'},
+                          room=p['sid'])
+        return False
+
+
+def start_debate(p1, p2, side_mode="random", topic=""):
+    title_a, title_b = random.sample(ALIAS_POOL, 2)
+    if side_mode == "a_pro":
+        side_a, side_b = "찬성", "반대"
+    elif side_mode == "a_con":
+        side_a, side_b = "반대", "찬성"
+    else:
         side_a, side_b = random.sample(["찬성", "반대"], 2)
-        p1['alias'] = title_a
-        p2['alias'] = title_b
-        p1['side'] = side_a
-        p2['side'] = side_b
-        room_id = f"room_{uuid.uuid4().hex[:8]}"
-        topic = take_topic()          # 미리 만들어둔 주제 — 기다리지 않는다
-        p1['connected'] = True
-        p2['connected'] = True
-        rooms[room_id] = {"players": [p1, p2], "turn_count": 0, "current_speaker": 0,
-                          "topic": topic, "logs": [], "turn_started": time.time(),
-                          "started_at": time.time()}
-        sid_to_room[p1['sid']] = room_id
-        sid_to_room[p2['sid']] = room_id
-        user_to_room[p1['username']] = room_id
-        user_to_room[p2['username']] = room_id
-        join_room(room_id, sid=p1['sid'])
-        join_room(room_id, sid=p2['sid'])
-        common = {'room_id': room_id, 'topic': topic, 'stage': STAGES[0], 'stage_index': 0,
-                  'total_stages': TOTAL_STAGES, 'seconds_left': turn_limit(0, 0),
-                  'speaker_alias': p1['alias'], 'speaker_side': p1['side'],
-                  'criteria': [{'stage': s, 'desc': d} for s, d in JUDGE_CRITERIA],
-                  'min_length': MIN_MESSAGE_LENGTH}
-        emit('match_found', {**common, 'your_turn': True,
-                             'my_alias': p1['alias'], 'opp_alias': p2['alias'],
-                             'my_side': p1['side'], 'opp_side': p2['side']}, room=p1['sid'])
-        emit('match_found', {**common, 'your_turn': False,
-                             'my_alias': p2['alias'], 'opp_alias': p1['alias'],
-                             'my_side': p2['side'], 'opp_side': p1['side']}, room=p2['sid'])
-
-
-@socketio.on('admin_watch')
-def handle_admin_watch(data):
-    if data.get('code') != ADMIN_CODE:
-        emit('error_msg', {'msg': '운영자 코드가 틀렸습니다.'})
-        return
-    room_id = data.get('room_id')
-    room = rooms.get(room_id)
-    if not room:
-        emit('error_msg', {'msg': '존재하지 않거나 이미 종료된 토론입니다.'})
-        return
-    join_room(f"watch_{room_id}")
-    history_logs = [{'stage': l['stage'], 'side': l['side'], 'message': l['text']} for l in room['logs']]
-    emit('admin_history', {'room_id': room_id, 'topic': room['topic'], 'logs': history_logs})
+    p1.update(alias=title_a, side=side_a, connected=True)
+    p2.update(alias=title_b, side=side_b, connected=True)
+    players = [p1, p2]
+    random.shuffle(players)            # 반론 이후 누가 먼저 말할지는 무작위
+    room_id = f"room_{uuid.uuid4().hex[:8]}"
+    topic = to_statement(topic) if topic else take_topic()
+    now = time.time()
+    rooms[room_id] = {"players": players, "turn_count": 0, "current_speaker": 0,
+                      "topic": topic, "logs": [], "openings": [None, None],
+                      "deadline": now + OPENING_SECONDS, "paused_at": None,
+                      "started_at": now}
+    for p in players:
+        p.pop('since', None)
+        sid_to_room[p['sid']] = room_id
+        user_to_room[p['username']] = room_id
+        socketio.server.enter_room(p['sid'], room_id, namespace='/')
+    common = {'room_id': room_id, 'topic': topic, 'stage': STAGES[0], 'stage_index': 0,
+              'total_stages': TOTAL_STAGES, 'seconds_left': OPENING_SECONDS,
+              'opening': True, 'your_turn': False,
+              'criteria': [{'stage': s, 'desc': d} for s, d in JUDGE_CRITERIA],
+              'min_length': MIN_MESSAGE_LENGTH}
+    for me, opp in ((players[0], players[1]), (players[1], players[0])):
+        socketio.emit('match_found', {**common,
+                                      'my_alias': me['alias'], 'opp_alias': opp['alias'],
+                                      'my_side': me['side'], 'opp_side': opp['side']}, room=me['sid'])
 
 
 def summarize_in_background(room_id, msg_id, text):
@@ -1798,25 +2598,135 @@ def summarize_in_background(room_id, msg_id, text):
                       room=f"watch_{room_id}")
 
 
+def settle_result(result, a, b, reveal):
+    """
+    AI 심사 결과를 전적에 반영할지 결정한다. a, b = (아이디, 진영)
+    반환: (winner 칸에 적을 값, 결과 문구, pending_json)
+    - 심사 실패 → '심사실패' (운영자가 재심사)
+    - 토론 의지 없음 지적 → '판정대기' (운영자가 승인/기각할 때까지 전적 미반영)
+    - 그 외 → 바로 반영
+    """
+    by_side = {a[1]: a[0], b[1]: b[0]}
+    if not result["ok"]:
+        return "심사실패", result["text"] + "\n\n" + reveal, {"type": "rejudge", "reveal": reveal}
+    if result["no_will_side"] != "없음":
+        pending = {"type": "no_will", "winner": result["winner"], "text": result["text"],
+                   "no_will_side": result["no_will_side"],
+                   "no_will_reason": result["no_will_reason"], "reveal": reveal}
+        text = ("⏳ AI가 '토론 의지 없음'을 지적해 운영자가 확인 중입니다.\n"
+                "최종 결과는 운영자 확인 후 랭킹·기록에 반영됩니다.\n\n" + reveal)
+        socketio.emit('admin_alert', {'msg': f"⚠️ 판정 대기 1건 — {result['no_will_side']}측 토론 의지 없음 의심"},
+                      room="admins")
+        return "판정대기", text, pending
+    winner = result["winner"]
+    if winner in by_side:
+        loser_side = b[1] if winner == a[1] else a[1]
+        record_win_loss(by_side[winner], by_side[loser_side])
+    return winner, result["text"] + "\n\n" + reveal, None
+
+
 def judge_in_background(room_id):
     """AI 심사를 따로 돌린다. 그동안 참가자에게는 심사 중 안내가 떠 있다."""
     room = rooms.get(room_id)
     if not room:
         return
-    winner_side, result_text = judge_debate(room['topic'], room['logs'])
-    player_a, player_b = room['players'][0], room['players'][1]
-    add_points(player_a['username'], 5)
-    add_points(player_b['username'], 5)
-    if winner_side == player_a['side']:
-        record_win_loss(player_a['username'], player_b['username'])
-    elif winner_side == player_b['side']:
-        record_win_loss(player_b['username'], player_a['username'])
-    final_text = result_text + "\n\n" + make_reveal_text(room)
-    save_debate(room['topic'], player_a['username'], player_b['username'],
-                player_a['side'], player_b['side'], room['logs'], winner_side, final_text)
+    try:
+        result = judge_debate(room['topic'], room['logs'])
+        pa, pb = room['players'][0], room['players'][1]
+        add_points(pa['username'], 5)
+        add_points(pb['username'], 5)
+        reveal = make_reveal_text(room)
+        winner, final_text, pending = settle_result(result, (pa['username'], pa['side']),
+                                                    (pb['username'], pb['side']), reveal)
+        save_debate(room['topic'], pa['username'], pb['username'], pa['side'], pb['side'],
+                    room['logs'], winner, final_text, pending)
+    except Exception as e:
+        print(f"[심사 처리 오류] {type(e).__name__}: {e}")
+        final_text = "⚠️ 심사 처리 중 오류가 났습니다. 운영자에게 알려주세요."
     socketio.emit('debate_end', {'result': final_text}, room=room_id)
     socketio.emit('admin_end', {'room_id': room_id, 'result': final_text}, room=f"watch_{room_id}")
     close_room(room_id)
+
+
+def _post_speech(room_id, room, speaker, text):
+    """발언 하나를 기록하고 양쪽·관전자에게 보낸다."""
+    stage_name = STAGES[min(room['turn_count'], TOTAL_STAGES - 1)]
+    msg_id = uuid.uuid4().hex[:12]
+    room['logs'].append({"side": speaker['side'], "stage": stage_name, "text": text})
+    socketio.emit('receive_message', {'sender': speaker['alias'], 'side': speaker['side'],
+                                      'message': text, 'msg_id': msg_id, 'stage': stage_name},
+                  room=room_id)
+    socketio.emit('admin_message', {'room_id': room_id, 'side': speaker['side'], 'msg_id': msg_id,
+                                    'message': text, 'stage': stage_name}, room=f"watch_{room_id}")
+    if text != TIMEOUT_MESSAGE:
+        socketio.start_background_task(summarize_in_background, room_id, msg_id, text)
+
+
+def _advance(room_id, room):
+    """다음 발언자로 넘기거나, 마지막이면 심사로."""
+    if room['turn_count'] >= TOTAL_STAGES:
+        room['judging'] = True
+        socketio.emit('judging', {'msg': 'AI가 토론을 심사하고 있습니다...'}, room=room_id)
+        socketio.emit('admin_stage', {'room_id': room_id, 'stage': 'AI 심사 중'}, room=f"watch_{room_id}")
+        socketio.start_background_task(judge_in_background, room_id)
+        return
+    next_idx = room['current_speaker']
+    room['deadline'] = time.time() + turn_limit(room['turn_count'])
+    if room.get('paused_at'):
+        room['paused_at'] = time.time()
+    for i, p in enumerate(room['players']):
+        socketio.emit('turn_change', {
+            'your_turn': i == next_idx, 'stage': STAGES[room['turn_count']],
+            'stage_index': room['turn_count'], 'stage_changed': room.get('_stage_changed', False),
+            'seconds_left': seconds_left(room),
+            'speaker_alias': room['players'][next_idx]['alias'],
+            'speaker_side': room['players'][next_idx]['side']}, room=p['sid'])
+    if room.get('_stage_changed'):
+        socketio.emit('admin_stage', {'room_id': room_id, 'stage': STAGES[room['turn_count']]},
+                      room=f"watch_{room_id}")
+    room['_stage_changed'] = False
+
+
+def submit_speech(room_id, idx, text):
+    """
+    발언 제출 (사람이 보낸 것이든 서버가 시간 초과로 대신 낸 것이든 같은 길로 처리).
+    반환: 오류 문구 또는 None
+    """
+    room = rooms.get(room_id)
+    if not room or room.get('judging'):
+        return "진행 중인 토론이 아닙니다."
+    me = room['players'][idx]
+
+    # ── 입론: 두 사람이 동시에 쓰고, 둘 다 내면(또는 시간이 끝나면) 함께 공개 ──
+    if room['turn_count'] == 0:
+        if room['openings'][idx] is not None:
+            return "이미 입론을 제출했습니다."
+        room['openings'][idx] = text
+        socketio.emit('opening_submitted', {}, room=me['sid'])
+        opp = room['players'][1 - idx]
+        socketio.emit('opp_opening_submitted', {}, room=opp['sid'])
+        socketio.emit('admin_stage', {'room_id': room_id,
+                                      'stage': f"{me['side']} 입론 제출 (상대 대기 중)"},
+                      room=f"watch_{room_id}")
+        if all(o is not None for o in room['openings']):
+            for i, p in enumerate(room['players']):
+                _post_speech(room_id, room, p, room['openings'][i])
+            room['turn_count'] = 1
+            room['current_speaker'] = 0
+            room['_stage_changed'] = True
+            _advance(room_id, room)
+        return None
+
+    # ── 반론 이후: 한 사람씩 번갈아 ──
+    if room['current_speaker'] != idx:
+        return "지금은 당신의 발언 차례가 아닙니다."
+    _post_speech(room_id, room, me, text)
+    if idx == 1:
+        room['turn_count'] += 1
+        room['_stage_changed'] = True
+    room['current_speaker'] = 1 - idx
+    _advance(room_id, room)
+    return None
 
 
 @socketio.on('send_message')
@@ -1826,77 +2736,56 @@ def handle_send_message(data):
     room = rooms.get(room_id)
     if not room or not msg_text:
         return
-    speaker_idx = room['current_speaker']
-    speaker = room['players'][speaker_idx]
-    if request.sid != speaker['sid']:
-        emit('error_msg', {'msg': '지금은 당신의 발언 차례가 아닙니다.'})
+    idx = next((i for i, p in enumerate(room['players']) if p['sid'] == request.sid), None)
+    if idx is None:
+        emit('error_msg', {'msg': '이 토론의 참가자가 아닙니다. 새로고침해주세요.'})
         return
-
     # 너무 짧은 발언은 반려한다 (시간 초과 자동 전송은 예외)
     if msg_text != TIMEOUT_MESSAGE and len(msg_text) < MIN_MESSAGE_LENGTH:
         emit('message_rejected', {
             'msg': f'발언이 너무 짧습니다. 최소 {MIN_MESSAGE_LENGTH}자 이상 작성해주세요.',
             'text': msg_text, 'length': len(msg_text), 'required': MIN_MESSAGE_LENGTH})
         return
-
-    stage_name = STAGES[room['turn_count']]
-    msg_id = uuid.uuid4().hex[:12]
-    room['logs'].append({"side": speaker['side'], "stage": stage_name, "text": msg_text})
-
-    # 발언은 즉시 전달하고, 느린 AI 요약은 백그라운드에서 채워 넣는다
-    emit('receive_message', {'sender': speaker['alias'], 'side': speaker['side'],
-                             'message': msg_text, 'msg_id': msg_id, 'stage': stage_name},
-         room=room_id)
-    emit('admin_message', {'room_id': room_id, 'side': speaker['side'], 'msg_id': msg_id,
-                           'message': msg_text, 'stage': stage_name}, room=f"watch_{room_id}")
-    socketio.start_background_task(summarize_in_background, room_id, msg_id, msg_text)
-
-    stage_completed = (speaker_idx == 1)
-    if stage_completed:
-        room['turn_count'] += 1
-    if room['turn_count'] >= TOTAL_STAGES:
-        # 심사도 느리므로 안내를 먼저 띄우고 백그라운드에서 처리
-        room['judging'] = True
-        emit('judging', {'msg': 'AI가 토론을 심사하고 있습니다...'}, room=room_id)
-        emit('admin_stage', {'room_id': room_id, 'stage': 'AI 심사 중'}, room=f"watch_{room_id}")
-        socketio.start_background_task(judge_in_background, room_id)
-    else:
-        room['current_speaker'] = 1 - speaker_idx
-        next_idx = room['current_speaker']
-        new_stage = STAGES[room['turn_count']]
-        room['turn_started'] = time.time()
-        for i, p in enumerate(room['players']):
-            emit('turn_change', {'your_turn': i == next_idx, 'stage': new_stage,
-                                 'stage_index': room['turn_count'], 'stage_changed': stage_completed,
-                                 'seconds_left': turn_limit(room['turn_count'], next_idx),
-                                 'speaker_alias': room['players'][next_idx]['alias'],
-                                 'speaker_side': room['players'][next_idx]['side']}, room=p['sid'])
-        if stage_completed:
-            emit('admin_stage', {'room_id': room_id, 'stage': new_stage}, room=f"watch_{room_id}")
+    err = submit_speech(room_id, idx, msg_text)
+    if err:
+        emit('error_msg', {'msg': err})
 
 
-def close_if_absent(room_id, username, marked_at):
-    """유예 시간이 지나도 안 돌아오면 토론을 종료한다. 승패는 기록하지 않는다."""
-    socketio.sleep(RECONNECT_GRACE_SECONDS)
-    room = rooms.get(room_id)
-    if not room or room.get('judging'):
-        return
-    leaver = next((p for p in room['players'] if p['username'] == username), None)
-    if not leaver or leaver.get('connected', True):
-        return                              # 돌아왔음
-    if leaver.get('disconnect_at') != marked_at:
-        return                              # 그사이 다시 끊긴 건이므로 최신 타이머에 맡긴다
-    stayer = next((p for p in room['players'] if p['username'] != username), None)
-    if not stayer:
-        return
-    end_without_result(room_id, leaver, stayer)
+def deadline_watcher():
+    """
+    브라우저가 잠들거나(모바일 화면 꺼짐) 자동 전송을 못 보내도 토론이 멈추지 않도록,
+    마감이 지난 차례는 서버가 '(시간 초과)'로 마감한다. 누가 끊겨 시계가 멈춘 방은 건드리지 않는다.
+    """
+    while True:
+        socketio.sleep(2)
+        try:
+            now = time.time()
+            for room_id, room in list(rooms.items()):
+                if room.get('judging') or room.get('paused_at'):
+                    continue
+                if now < room['deadline'] + SERVER_TIMEOUT_GRACE:
+                    continue
+                if room['turn_count'] == 0:
+                    for i in (0, 1):
+                        if rooms.get(room_id) and room['openings'][i] is None and room['turn_count'] == 0:
+                            submit_speech(room_id, i, TIMEOUT_MESSAGE)
+                else:
+                    submit_speech(room_id, room['current_speaker'], TIMEOUT_MESSAGE)
+        except Exception as e:
+            print(f"[마감 감시 오류] {type(e).__name__}: {e}")
+
+
+socketio.start_background_task(deadline_watcher)
 
 
 @socketio.on('disconnect')
 def handle_disconnect(*args):
     sid = request.sid
-    username = sid_to_user.pop(sid, None)
+    sid_to_user.pop(sid, None)
+    before = len(waiting_pool)
     waiting_pool[:] = [p for p in waiting_pool if p['sid'] != sid]
+    if len(waiting_pool) != before:
+        notify_waiting_status()
     room_id = sid_to_room.pop(sid, None)
     if not room_id or room_id not in rooms:
         return
@@ -1907,61 +2796,19 @@ def handle_disconnect(*args):
     stayer = next((p for p in room['players'] if p['sid'] != sid), None)
     if not leaver or not stayer:
         return
-
-    # 즉시 몰수시키지 않고 유예 시간을 준다 — 잠깐 끊긴 것일 수 있다
-    marked_at = time.time()
+    # 토론은 끝내지 않는다. 시계를 멈추고 돌아올 때까지 기다린다.
     leaver['connected'] = False
-    leaver['disconnect_at'] = marked_at
-    socketio.emit('opponent_disconnected',
-                  {'seconds': RECONNECT_GRACE_SECONDS}, room=stayer['sid'])
-    socketio.start_background_task(close_if_absent, room_id, leaver['username'], marked_at)
+    leaver['disconnect_at'] = time.time()
+    pause_clock(room)
+    socketio.emit('opponent_disconnected', {}, room=stayer['sid'])
+    socketio.emit('admin_stage', {'room_id': room_id, 'stage': f"⚠️ {leaver['username']} 연결 끊김 — 시계 정지"},
+                  room=f"watch_{room_id}")
 
 
-@socketio.on('resume')
-def handle_resume(data):
-    """끊겼다 돌아온 참가자를 원래 방에 다시 앉힌다."""
-    token = (data or {}).get('token')
-    username = resume_tokens.get(token)
-    if not username:
-        emit('resume_failed', {})
-        return
-    sid = request.sid
-    sid_to_user[sid] = username
-    room_id = user_to_room.get(username)
-    room = rooms.get(room_id) if room_id else None
-    if not room:
-        emit('resume_failed', {})
-        return
-
-    me = next((p for p in room['players'] if p['username'] == username), None)
-    opp = next((p for p in room['players'] if p['username'] != username), None)
-    if not me or not opp:
-        emit('resume_failed', {})
-        return
-
-    my_index = room['players'].index(me)
-    me['sid'] = sid
-    me['connected'] = True
-    sid_to_room[sid] = room_id
-    join_room(room_id)
-
-    stage_idx = min(room['turn_count'], TOTAL_STAGES - 1)
-    emit('resumed', {
-        'room_id': room_id, 'topic': room['topic'],
-        'my_alias': me['alias'], 'opp_alias': opp['alias'],
-        'my_side': me['side'], 'opp_side': opp['side'],
-        'stage': STAGES[stage_idx], 'stage_index': stage_idx, 'total_stages': TOTAL_STAGES,
-        'your_turn': room['current_speaker'] == my_index,
-        'seconds_left': max(0, int(turn_limit(room['turn_count'], room['current_speaker'])
-                                   - (time.time() - room.get('turn_started', time.time())))),
-        'speaker_alias': room['players'][room['current_speaker']]['alias'],
-        'speaker_side': room['players'][room['current_speaker']]['side'],
-        'criteria': [{'stage': s, 'desc': d} for s, d in JUDGE_CRITERIA],
-        'min_length': MIN_MESSAGE_LENGTH,
-        'logs': [{'sender': (me['alias'] if l['side'] == me['side'] else opp['alias']),
-                  'side': l['side'], 'stage': l['stage'], 'message': l['text']} for l in room['logs']],
-    })
-    socketio.emit('opponent_reconnected', {}, room=opp['sid'])
+@socketio.on('leave_queue')
+def handle_leave_queue(data=None):
+    waiting_pool[:] = [p for p in waiting_pool if p['sid'] != request.sid]
+    notify_waiting_status()
 
 
 if __name__ == '__main__':

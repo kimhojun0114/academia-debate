@@ -6,6 +6,4 @@ gevent-websocket
 psycogreen
 packaging
 psycopg2-binary
-anthropic
 openai
-google-genai
