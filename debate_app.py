@@ -1051,14 +1051,19 @@ let wantQueue=false,kicked=false;
 const TIMER_SECONDS={{ turn_seconds }};
 let timerInterval=null,remaining=TIMER_SECONDS,deadlineAt=0,minLength={{ min_length }};
 // 새로고침해도 이어지도록 접속 토큰과 작성 중인 초안을 브라우저에 보관한다
+// 접속 토큰은 탭마다 따로(sessionStorage) — 같은 브라우저의 다른 탭이 서로의 아이디로 들어가지 않게.
+// 초안은 브라우저에(localStorage) 방+진영별로 — 탭을 닫았다 다시 로그인해도 남아 있게.
 function store(k,v){try{if(v===null)localStorage.removeItem(k);else localStorage.setItem(k,v);}catch(e){}}
 function load(k){try{return localStorage.getItem(k);}catch(e){return null;}}
-let resumeToken=load('debate_token')||"";
-function draftKey(){return 'debate_draft_'+currentRoom;}
+function tokSave(v){try{if(v===null)sessionStorage.removeItem('debate_token');else sessionStorage.setItem('debate_token',v);}catch(e){}}
+function tokLoad(){try{return sessionStorage.getItem('debate_token');}catch(e){return null;}}
+try{localStorage.removeItem('debate_token');}catch(e){}   // 예전 방식으로 저장된 토큰 정리
+let resumeToken=tokLoad()||"";
+function draftKey(){return 'debate_draft_'+currentRoom+'_'+mySide;}
 function saveDraft(){if(currentRoom)store(draftKey(),document.getElementById('msg-input').value);}
 function restoreDraft(){const el=document.getElementById('msg-input');const v=load(draftKey());
   if(v&&!el.value.trim())el.value=v;updateLenHint();}
-function clearDrafts(){try{Object.keys(localStorage).filter(k=>k.startsWith('debate_draft_')).forEach(k=>localStorage.removeItem(k));}catch(e){}}
+function clearDrafts(){if(currentRoom)store(draftKey(),null);}
 
 function canSend(){return !oppGone&&!judging&&(opening?!myOpeningDone:myTurn);}
 // 타이머는 마감 시각 기준 — 휴대폰 화면이 꺼졌다 켜져도 정확하다
@@ -1112,9 +1117,9 @@ function surrender(){
   socket.emit('surrender',{});}
 function login(){const n=document.getElementById('username').value,p=document.getElementById('pin').value;
   if(!n.trim()||!p.trim())return alert('아이디와 PIN을 입력해주세요.');socket.emit('login',{username:n,pin:p});}
-function logout(){store('debate_token',null);clearDrafts();location.reload();}
+function logout(){tokSave(null);clearDrafts();location.reload();}
 socket.on('login_ok',d=>{
-  resumeToken=d.resume_token||"";store('debate_token',resumeToken);
+  resumeToken=d.resume_token||"";tokSave(resumeToken);
   document.getElementById('login-area').classList.add('hidden');
   if(!currentRoom)document.getElementById('profile-area').classList.remove('hidden');
   document.getElementById('my-name').textContent=d.username;
@@ -1164,7 +1169,7 @@ socket.on('resumed',d=>{
   if(oppGone)showOppGone();
   updateTurnUI(d.seconds_left);});
 socket.on('resume_failed',()=>{setNetBanner('','');
-  store('debate_token',null);resumeToken="";
+  tokSave(null);resumeToken="";
   if(currentRoom){alert('토론이 이미 종료되었습니다. 다시 로그인해주세요.');location.reload();}});
 function showOppGone(){stopTimer();
   setNetBanner('⏸ 상대방 연결이 끊겼습니다. 돌아올 때까지 시계가 멈춥니다.','#d97706');
