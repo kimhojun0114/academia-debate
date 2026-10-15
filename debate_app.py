@@ -1193,7 +1193,7 @@ socket.on('login_ok',d=>{
   const lr=document.getElementById('last-result');
   if(d.last_result){const r=d.last_result;lr.classList.remove('hidden');
     lr.querySelector('summary').textContent="📋 최근 경기: "+r.outcome+" ("+r.my_side+") · "+r.played_at;
-    lr.querySelector('.lr-body').textContent="📌 "+r.topic+"\n\n"+r.reason;}
+    lr.querySelector('.lr-body').textContent="📌 "+r.topic+"\\n\\n"+r.reason;}
   else{lr.classList.add('hidden');}
   // 대기실에 있다가 연결이 잠깐 끊겼으면 다시 줄을 선다
   if(wantQueue&&!currentRoom)socket.emit('join_queue',{});});
