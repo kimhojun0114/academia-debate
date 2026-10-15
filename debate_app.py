@@ -1048,7 +1048,7 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
   <input type="password" id="pin" placeholder="PIN" style="padding:8px;width:35%;">
   <button onclick="login()" style="padding:8px 15px;cursor:pointer;">로그인</button>
   <p id="status-text" style="color:#2563eb;font-weight:bold;margin-top:10px;"></p>
-  <p class="nav"><a href="/ranking">🏆 랭킹 보기</a> · <a href="/history">📚 토론 기록</a></p>
+  <p class="nav"><a href="/ranking">🏆 랭킹 보기</a> · <a href="/history">📚 토론 기록</a> · <a href="/admin">🛠️ 관리자</a></p>
 </div>
 <div id="profile-area" class="box hidden">
   <p>👤 <b id="my-name"></b>님, 환영합니다!</p>
@@ -1061,7 +1061,7 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
   <button onclick="joinQueue()" id="match-btn" style="padding:10px 20px;cursor:pointer;background:#2563eb;color:white;border:none;border-radius:6px;font-weight:bold;">토론 매칭 시작</button>
   <button onclick="cancelQueue()" id="cancel-btn" class="hidden" style="padding:10px 16px;cursor:pointer;background:#fff !important;color:#dc2626 !important;-webkit-text-fill-color:#dc2626;border:1px solid #fca5a5;border-radius:6px;font-weight:bold;">매칭 취소</button>
   <p id="queue-text" style="color:#2563eb;font-weight:bold;margin-top:10px;"></p>
-  <p class="nav"><a href="/ranking">🏆 랭킹 보기</a> · <a href="/history">📚 토론 기록</a> · <a href="#" onclick="logout();return false;">로그아웃</a></p>
+  <p class="nav"><a href="/ranking">🏆 랭킹 보기</a> · <a href="/history">📚 토론 기록</a> · <a href="/admin">🛠️ 관리자</a> · <a href="#" onclick="logout();return false;">로그아웃</a></p>
 </div>
 <div id="debate-area" class="box hidden">
   <div id="stage-dots"></div>
@@ -1918,7 +1918,7 @@ th.num,td.num{text-align:right;}
 <tr><td colspan="5" class="empty">아직 등록된 참가자가 없습니다.</td></tr>
 {% endfor %}
 </table>
-<p class="nav"><a href="/">← 토론 화면</a> · <a href="/history">토론 기록</a></p>
+<p class="nav"><a href="/">← 토론 화면</a> · <a href="/history">📚 토론 기록</a> · <a href="/admin">🛠️ 관리자</a></p>
 </div>
 </body></html>"""
 
@@ -1945,7 +1945,7 @@ HISTORY_TEMPLATE = """<!DOCTYPE html>
 <details><summary>토론 전문 보기</summary>
 {% for line in d.logs %}<p class="log-line {{ 'pro' if line.side == '찬성' else 'con' }}"><b>[{{ line.stage }}] {{ line.side }}:</b> {{ line.text }}{% if line.auto %} <span class="sum">⏰ 시간 종료 자동 제출</span>{% endif %}{% if line.summary %}<br><span class="sum">🤖 요약: {{ line.summary }}</span>{% endif %}</p>{% endfor %}
 </details></div>{% else %}<p>아직 토론 기록이 없습니다.</p>{% endfor %}
-<p><a href="/">← 토론 화면</a> · <a href="/ranking">🏆 랭킹</a></p></body></html>"""
+<p><a href="/">← 토론 화면</a> · <a href="/ranking">🏆 랭킹</a> · <a href="/admin">🛠️ 관리자</a></p></body></html>"""
 
 
 @app.route('/')
