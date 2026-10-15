@@ -1568,14 +1568,18 @@ button:disabled{opacity:.5;cursor:not-allowed;}
 <div id="panel-danger" class="panel" style="display:none;">
   <div class="box">
     <h3>🗑️ 아이디 삭제</h3>
-    <p class="hint">삭제하면 전적도 함께 사라지고 되돌릴 수 없습니다.</p>
-    <div id="del-users"></div>
+    <p class="hint">삭제하면 전적도 함께 사라지고 되돌릴 수 없습니다. 토론 중인 아이디는 건너뜁니다.</p>
+    <label class="hint"><input type="checkbox" onchange="checkAll('u',this.checked)"> 전체 선택</label>
+    <div id="del-users" style="max-height:360px;overflow-y:auto;"></div>
+    <button class="red" id="del-users-btn" onclick="delUsers()" disabled>체크한 아이디 삭제</button>
   </div>
   <div class="box">
     <h3>📚 토론 기록 삭제 <span id="debate-count" class="hint"></span></h3>
     <p class="hint">기록만 지워지고 승패·점수는 바뀌지 않습니다. 점수까지 되돌리려면 아래 초기화를 쓰세요.</p>
+    <label class="hint"><input type="checkbox" onchange="checkAll('d',this.checked)"> 전체 선택</label>
     <div id="del-debates" style="max-height:360px;overflow-y:auto;"></div>
-    <button class="redline" onclick="delDebate(null,true)">기록 전체 삭제</button>
+    <button class="red" id="del-debates-btn" onclick="delDebates()" disabled>체크한 기록 삭제</button>
+    <button class="redline" onclick="delDebatesAll()">기록 전체 삭제</button>
   </div>
   <div class="box">
     <h3>🔄 점수·전적 초기화</h3>
@@ -1840,23 +1844,37 @@ async function changePin(){try{await api('users/pin',{username:document.getEleme
 // ── 삭제 ──
 async function refreshDanger(){let d;try{d=await api('danger/state');}catch(e){return;}
   document.getElementById('del-users').innerHTML=d.users.length?"<table>"+d.users.map(u=>
-    "<tr><td><b>"+esc(u.username)+"</b> <span class='hint'>"+u.wins+"승 "+u.losses+"패 · "+u.points+"점</span></td>"+
-    "<td style='text-align:right;'><button class='redline' onclick=\"delUser('"+esc(u.username)+"')\">삭제</button></td></tr>").join('')+"</table>":
+    "<tr><td style='width:28px;'><input type='checkbox' class='ck-u' value='"+esc(u.username)+"' onchange='updateDelBtns()'></td>"+
+    "<td><b>"+esc(u.username)+"</b> <span class='hint'>"+u.wins+"승 "+u.losses+"패 · "+u.points+"점</span></td></tr>").join('')+"</table>":
     "<p class='hint'>아이디가 없습니다.</p>";
   document.getElementById('debate-count').textContent='(최근 '+d.debates.length+'건)';
   document.getElementById('del-debates').innerHTML=d.debates.length?"<table>"+d.debates.map(x=>
-    "<tr><td><b>"+esc(x.topic)+"</b><br><span class='hint'>"+esc(x.played_at)+" · "+esc(x.player_a)+" vs "+esc(x.player_b)+
-    " · "+esc(x.winner)+"</span></td><td style='text-align:right;'><button class='redline' onclick='delDebate("+x.id+")'>삭제</button></td></tr>").join('')+"</table>":
+    "<tr><td style='width:28px;'><input type='checkbox' class='ck-d' value='"+x.id+"' onchange='updateDelBtns()'></td>"+
+    "<td><b>"+esc(x.topic)+"</b><br><span class='hint'>"+esc(x.played_at)+" · "+esc(x.player_a)+" vs "+esc(x.player_b)+
+    " · "+esc(x.winner)+"</span></td></tr>").join('')+"</table>":
     "<p class='hint'>토론 기록이 없습니다.</p>";
+  document.querySelectorAll('#panel-danger input[type=checkbox]').forEach(c=>{if(!c.classList.length)c.checked=false;});
+  updateDelBtns();
   document.getElementById('del-profiles').innerHTML=d.profiles.length?"<table>"+d.profiles.map(p=>
     "<tr><td><b>"+esc(p.name)+"</b> <span class='hint'>"+esc(p.model)+(p.name===d.active?' · 사용 중':'')+"</span></td>"+
     "<td style='text-align:right;'><button class='redline' onclick=\"delProfile('"+esc(p.name)+"')\">삭제</button></td></tr>").join('')+"</table>":
     "<p class='hint'>등록된 키가 없습니다.</p>";}
-async function delUser(n){if(!confirm("'"+n+"' 아이디를 삭제할까요? 되돌릴 수 없습니다."))return;
-  try{await api('danger/delete_user',{username:n});}catch(e){}refreshDanger();}
-async function delDebate(id,all){
-  if(!confirm(all?'토론 기록을 전부 삭제할까요? 되돌릴 수 없습니다.':'이 토론 기록을 삭제할까요?'))return;
-  try{await api('danger/delete_debate',all?{all:true}:{id});}catch(e){}refreshDanger();}
+function checked(kind){return [...document.querySelectorAll('.ck-'+kind+':checked')].map(c=>c.value);}
+function checkAll(kind,on){document.querySelectorAll('.ck-'+kind).forEach(c=>c.checked=on);updateDelBtns();}
+function updateDelBtns(){
+  const u=checked('u').length,d=checked('d').length;
+  const bu=document.getElementById('del-users-btn'),bd=document.getElementById('del-debates-btn');
+  bu.disabled=!u;bu.textContent='체크한 아이디 삭제'+(u?' ('+u+')':'');
+  bd.disabled=!d;bd.textContent='체크한 기록 삭제'+(d?' ('+d+')':'');}
+async function delUsers(){const names=checked('u');if(!names.length)return;
+  if(!confirm('아이디 '+names.length+'개를 삭제할까요? 되돌릴 수 없습니다.\n\n'+names.join(', ')))return;
+  try{await api('danger/delete_user',{usernames:names});}catch(e){}refreshDanger();}
+async function delDebates(){const ids=checked('d').map(Number);if(!ids.length)return;
+  if(!confirm('토론 기록 '+ids.length+'건을 삭제할까요? 되돌릴 수 없습니다.'))return;
+  try{await api('danger/delete_debate',{ids});}catch(e){}refreshDanger();}
+async function delDebatesAll(){
+  if(!confirm('토론 기록을 전부 삭제할까요? 되돌릴 수 없습니다.'))return;
+  try{await api('danger/delete_debate',{all:true});}catch(e){}refreshDanger();}
 async function resetScores(){
   if(!confirm('모든 아이디의 점수와 전적을 0으로 초기화할까요?\n되돌릴 수 없습니다.'))return;
   try{await api('danger/reset_scores');}catch(e){}refreshDanger();}
@@ -2489,23 +2507,33 @@ def danger_delete_debate(data):
     if data.get("all"):
         db_execute("DELETE FROM debates")
         return jsonify({"ok": True, "msg": "토론 기록을 모두 삭제했습니다. (전적·점수는 그대로)"})
-    did = data.get("id")
-    if not db_fetchone("SELECT id FROM debates WHERE id = %s", (did,)):
-        return jsonify({"error": "없는 기록입니다."}), 400
-    db_execute("DELETE FROM debates WHERE id = %s", (did,))
-    return jsonify({"ok": True, "msg": "토론 기록 1건을 삭제했습니다. (전적·점수는 그대로)"})
+    ids = data.get("ids") or ([data["id"]] if data.get("id") is not None else [])
+    try:
+        ids = [int(i) for i in ids]
+    except (TypeError, ValueError):
+        return jsonify({"error": "잘못된 요청입니다."}), 400
+    if not ids:
+        return jsonify({"error": "삭제할 기록을 체크해주세요."}), 400
+    db_execute("DELETE FROM debates WHERE id = ANY(%s)", (ids,))
+    return jsonify({"ok": True, "msg": f"토론 기록 {len(ids)}건을 삭제했습니다. (전적·점수는 그대로)"})
 
 
 @app.route('/admin/api/danger/delete_user', methods=['POST'])
 @admin_api("danger")
 def danger_delete_user(data):
-    target = (data.get("username") or "").strip()
-    if not db_fetchone("SELECT username FROM users WHERE username = %s", (target,)):
-        return jsonify({"error": f"'{target}' 아이디를 찾을 수 없습니다."}), 400
-    if target in user_to_room:
-        return jsonify({"error": "토론 중인 아이디는 삭제할 수 없습니다."}), 400
-    db_execute("DELETE FROM users WHERE username = %s", (target,))
-    return jsonify({"ok": True, "msg": f"'{target}' 삭제 완료"})
+    """체크한 아이디들을 한꺼번에 삭제. 토론 중인 아이디는 건너뛴다."""
+    targets = data.get("usernames") or ([data["username"]] if data.get("username") else [])
+    targets = [str(t).strip() for t in targets if str(t).strip()]
+    if not targets:
+        return jsonify({"error": "삭제할 아이디를 체크해주세요."}), 400
+    busy = [t for t in targets if t in user_to_room]
+    todo = [t for t in targets if t not in user_to_room]
+    if todo:
+        db_execute("DELETE FROM users WHERE username = ANY(%s)", (todo,))
+    msg = f"아이디 {len(todo)}개 삭제 완료"
+    if busy:
+        msg += f" — 토론 중이라 건너뜀: {', '.join(busy)}"
+    return jsonify({"ok": True, "msg": msg})
 
 
 @app.route('/admin/api/danger/reset_scores', methods=['POST'])
