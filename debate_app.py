@@ -92,10 +92,10 @@ TEST_MODE = "테스트 모드"
 
 # AI는 ChatGPT(OpenAI) 하나만 쓴다.
 PROVIDER = "openai"
-DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_MODEL = "gpt-6.1-sol"   # 모델은 고정 — 관리자 화면에서는 키만 등록한다
 # 지정한 모델이 없다고(404 model_not_found) 나오면 순서대로 시도한다.
 # 모델명이 틀렸을 때 엉뚱한 오류로 헤매지 않도록.
-FALLBACK_MODELS = ["gpt-5.4-mini", "gpt-5-mini", "gpt-4o-mini"]
+FALLBACK_MODELS = ["gpt-6.1-sol", "gpt-5.6-terra", "gpt-5.4-mini"]
 DEFAULT_MAX_RPM = 120           # 유료 키 기준. 관리자 화면에서 조정 가능
 
 # AI가 주제를 못 만들 때 쓸 예비 주제. 예전처럼 한 주제만 반복되지 않도록 여러 개를 둔다.
@@ -231,6 +231,7 @@ def seed_default_profile():
             upsert_profile("ChatGPT", PROVIDER, DEFAULT_MODEL, env_key)
         elif not (row[0] or "").strip():
             db_execute("UPDATE ai_profiles SET api_key = %s WHERE name = %s", (env_key, "ChatGPT"))
+    db_execute("UPDATE ai_profiles SET model = %s WHERE model IS DISTINCT FROM %s", (DEFAULT_MODEL, DEFAULT_MODEL))
     names = [p["name"] for p in list_profiles()]
     active = get_setting("active_profile")
     if active != TEST_MODE and active not in names:
@@ -1426,7 +1427,7 @@ button:disabled{opacity:.5;cursor:not-allowed;}
     <h3>🔑 키 등록 / 변경</h3>
     <p class="hint">같은 이름으로 다시 저장하면 덮어씁니다. 키는 DB에 저장돼 재배포해도 유지됩니다.</p>
     <div class="row"><input type="text" id="ai-name" placeholder="이름 (예: ChatGPT)" style="width:150px;">
-      <input type="text" id="ai-model" placeholder="모델" style="width:180px;"></div>
+      <span class="hint" id="ai-model-note"></span></div>
     <div class="row"><input type="password" id="ai-key" placeholder="API 키 (비우면 기존 키 유지)" style="flex:1;min-width:240px;" autocomplete="off"></div>
     <label class="hint"><input type="checkbox" id="ai-activate" checked> 저장 후 바로 이 AI 사용</label>
     <div class="row"><button onclick="saveAI()">저장</button></div>
@@ -1668,7 +1669,7 @@ async function refreshAI(){
     "> <b>"+esc(p.name)+"</b> — "+esc(p.model)+" "+(p.masked?"<span class='hint'>"+esc(p.masked)+"</span>":"")+
     (p.redirect?" <span class='bad'>(모델 없음 → "+esc(p.redirect)+" 사용 중)</span>":"")+"</label>").join('')+
     (d.profiles.length?'':"<p class='warn'>등록된 ChatGPT 키가 없습니다. 아래에서 등록하세요.</p>");
-  document.getElementById('ai-model').placeholder='모델 (비우면 '+d.default_model+')';
+  document.getElementById('ai-model-note').textContent='모델: '+d.default_model+' (고정)';
   document.getElementById('set-draw').checked=d.allow_draw;
   document.getElementById('set-summary').checked=d.summary_on;
   document.getElementById('set-rpm').value=d.rpm_limit;
@@ -1686,7 +1687,7 @@ async function switchAI(){const v=document.querySelector('input[name=prof]:check
 async function testAI(){const out=document.getElementById('test-out');out.textContent='테스트 중...';
   try{const d=await api('ai/test');out.textContent=d.msg;}catch(e){out.textContent='';}refreshAI();}
 async function saveAI(){try{await api('ai/save',{name:document.getElementById('ai-name').value,
-  model:document.getElementById('ai-model').value,key:document.getElementById('ai-key').value,
+  key:document.getElementById('ai-key').value,
   activate:document.getElementById('ai-activate').checked});document.getElementById('ai-key').value='';}catch(e){}refreshAI();}
 async function saveSettings(){try{await api('ai/settings',{allow_draw:document.getElementById('set-draw').checked,
   summary_on:document.getElementById('set-summary').checked,max_rpm:document.getElementById('set-rpm').value});}catch(e){}refreshAI();}
@@ -2204,14 +2205,13 @@ def ai_test(data):
 @admin_api("ai")
 def ai_save(data):
     name = (data.get("name") or "").strip()
-    model = (data.get("model") or "").strip()
     key = (data.get("key") or "").strip()
     if not name:
         return jsonify({"error": "이름을 입력해주세요."}), 400
     if name == TEST_MODE:
         return jsonify({"error": f"'{TEST_MODE}'는 예약된 이름입니다."}), 400
     existing = db_fetchone("SELECT model, api_key FROM ai_profiles WHERE name = %s", (name,))
-    model = model or (existing[0] if existing and existing[0] else DEFAULT_MODEL)
+    model = DEFAULT_MODEL
     key = key or ((existing[1] if existing else '') or '')
     if not key:
         return jsonify({"error": "API 키를 입력해주세요. (신규 등록은 키가 필요합니다)"}), 400
