@@ -1415,10 +1415,10 @@ button:disabled{opacity:.5;cursor:not-allowed;}
 <div id="panel-ops" class="panel" style="display:none;">
   <div class="box">
     <h3>🎯 매칭 방식</h3>
-    <label class="switch"><input type="checkbox" id="auto-match" onchange="setAuto(this.checked)">
-      <span id="auto-label">자동(랜덤) 매칭</span></label>
-    <p class="hint">켜면: 대기실에 들어온 사람끼리 랜덤으로 붙습니다 (예약된 사람은 제외).<br>
-    끄면: 대기실에 쌓이기만 하고, 아래에서 운영자가 직접 붙입니다. 토너먼트 때는 끄세요.</p>
+    <p id="mode-line" style="font-weight:bold;margin:4px 0 8px;"></p>
+    <button id="mode-btn" onclick="toggleMode()"></button>
+    <p class="hint">기본은 <b>랜덤 매칭</b> — 대기실에 들어온 사람끼리 자동으로 붙습니다.<br>
+    <b>주작 매칭 모드</b>를 켜면 랜덤 매칭이 멈추고, 아래 대기실에서 운영자가 직접 붙이거나 예약할 수 있습니다.</p>
     <label class="switch" style="margin-top:8px;"><input type="checkbox" id="allow-paste" onchange="setPaste(this.checked)">
       <span id="paste-label">복사·붙여넣기 허용 (테스트용)</span></label>
     <p class="hint">테스트할 때만 켜세요. <b>대회 전에 반드시 끄기.</b> 바꾼 뒤 참가자가 새로고침해야 적용됩니다.</p>
@@ -1427,6 +1427,8 @@ button:disabled{opacity:.5;cursor:not-allowed;}
   <div class="box">
     <h3>🧑‍🤝‍🧑 대기실 <span id="wait-count" class="hint"></span></h3>
     <div id="waiting"></div>
+    <p class="hint" id="manual-off-note" style="color:#b45309;font-weight:bold;">🔒 지정 매칭·예약은 위에서 '주작 매칭 모드'를 켜야 쓸 수 있습니다.</p>
+    <fieldset id="manual-ctrl" style="border:none;padding:0;margin:0;">
     <p class="hint">이름을 누르면 아래 A → B 칸에 차례로 들어갑니다. 점선 = 예약된 사람</p>
     <div class="row">
       <input type="text" id="pa" placeholder="A 아이디" style="width:130px;">
@@ -1448,6 +1450,7 @@ button:disabled{opacity:.5;cursor:not-allowed;}
     </div>
     <p class="hint"><b>지금 매칭</b>: 두 사람이 대기실에 있어야 합니다. 바로 시작.<br>
     <b>예약 등록</b>: 아직 안 들어왔어도 됩니다. 둘 다 대기실에 들어오면 자동으로 시작.</p>
+    </fieldset>
     <div id="reservations"></div>
   </div>
 
@@ -1604,11 +1607,19 @@ async function refreshOps(){
   if(tab!=='ops'||!token)return;
   let d;try{d=await api('ops/state');}catch(e){return;}
   opsState=d;
-  const am=document.getElementById('auto-match');am.checked=d.auto_match;
+  const manual=!d.auto_match;
+  document.getElementById('mode-line').innerHTML=manual?
+    "<span style='color:#b45309;'>🎯 주작 매칭 모드 — 랜덤 매칭 멈춤, 운영자가 직접 배정</span>":
+    "<span style='color:#16a34a;'>🎲 랜덤 매칭 중</span>";
+  const mb=document.getElementById('mode-btn');
+  mb.textContent=manual?'🎲 랜덤 매칭으로 돌아가기':'🎯 주작 매칭 모드 켜기';
+  mb.className=manual?'sub':'';
+  document.getElementById('manual-ctrl').disabled=!manual;
+  document.getElementById('manual-ctrl').style.opacity=manual?'1':'.45';
+  document.getElementById('manual-off-note').style.display=manual?'none':'';
   const ap=document.getElementById('allow-paste');ap.checked=d.allow_paste;
   document.getElementById('paste-label').innerHTML=d.allow_paste?
     "복사·붙여넣기 <b style='color:#dc2626;'>허용 중 ⚠️ 대회 전에 끄세요</b>":"복사·붙여넣기 허용 (테스트용) — 지금은 금지";
-  document.getElementById('auto-label').textContent='자동(랜덤) 매칭 '+(d.auto_match?'켜짐':'꺼짐 — 운영자 배정');
   document.getElementById('wait-count').textContent='('+d.waiting.length+'명)';
   const pa=document.getElementById('pa').value,pb=document.getElementById('pb').value;
   document.getElementById('waiting').innerHTML=d.waiting.length?d.waiting.map(w=>
@@ -1624,6 +1635,7 @@ async function refreshOps(){
   renderRooms(d.rooms,d.absent_alert);
 }
 function pick(name){
+  if(document.getElementById('manual-ctrl').disabled)return;
   const a=document.getElementById('pa'),b=document.getElementById('pb');
   if(a.value===name){a.value='';}else if(b.value===name){b.value='';}
   else if(!a.value){a.value=name;}else{b.value=name;}
@@ -1639,7 +1651,11 @@ async function pairNow(){try{await api('ops/pair',pairBody());clearPair();}catch
 async function reserve(){try{await api('ops/reserve',pairBody());clearPair();}catch(e){}refreshOps();}
 async function unreserve(id){try{await api('ops/unreserve',{id});}catch(e){}refreshOps();}
 async function setPaste(on){try{await api('ops/paste',{on});}catch(e){}refreshOps();}
-async function setAuto(on){try{await api('ops/auto',{on});}catch(e){}refreshOps();}
+async function toggleMode(){
+  const toManual=!!(opsState&&opsState.auto_match);
+  if(!toManual&&opsState&&opsState.reservations.length&&
+     !confirm('남아 있는 예약 '+opsState.reservations.length+'건은 랜덤 매칭 중에도 그대로 유지됩니다.\n(예약된 사람은 랜덤으로 붙지 않고 서로를 기다립니다)\n\n랜덤 매칭으로 돌아갈까요?'))return;
+  try{await api('ops/auto',{on:!toManual});}catch(e){}refreshOps();}
 
 function renderPending(list){
   const box=document.getElementById('pending-box');
@@ -2086,7 +2102,7 @@ def ops_auto(data):
     notify_waiting_status()
     if on:
         try_match()
-    return jsonify({"ok": True, "msg": "자동(랜덤) 매칭 " + ("켜짐" if on else "꺼짐")})
+    return jsonify({"ok": True, "msg": "랜덤 매칭으로 전환" if on else "주작 매칭 모드 — 랜덤 매칭을 멈췄습니다"})
 
 
 @app.route('/admin/api/ops/paste', methods=['POST'])
@@ -2104,6 +2120,8 @@ SIDE_MODES = ("random", "a_pro", "a_con")
 @app.route('/admin/api/ops/pair', methods=['POST'])
 @admin_api("ops")
 def ops_pair(data):
+    if auto_match_on():
+        return jsonify({"error": "주작 매칭 모드를 먼저 켜주세요."}), 400
     a, b = (data.get("a") or "").strip(), (data.get("b") or "").strip()
     side = data.get("side") if data.get("side") in SIDE_MODES else "random"
     topic = (data.get("topic") or "").strip()
@@ -2125,6 +2143,8 @@ def ops_pair(data):
 @app.route('/admin/api/ops/reserve', methods=['POST'])
 @admin_api("ops")
 def ops_reserve(data):
+    if auto_match_on():
+        return jsonify({"error": "주작 매칭 모드를 먼저 켜주세요."}), 400
     a, b = (data.get("a") or "").strip(), (data.get("b") or "").strip()
     side = data.get("side") if data.get("side") in SIDE_MODES else "random"
     topic = (data.get("topic") or "").strip()
