@@ -1515,7 +1515,8 @@ async function unlock(){
   const r=await fetch('/admin/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({tab,code})});
   const d=await r.json().catch(()=>({error:'서버 응답 오류'}));
-  if(!r.ok){toast(d.error||'실패',true);document.getElementById('lock-code').value='';return;}
+  if(!r.ok){alert(r.status===403?'❌ 운영자 코드가 틀렸습니다.':(d.error||'실패'));
+    const c=document.getElementById('lock-code');c.value='';c.focus();return;}
   token=d.token;
   document.getElementById('lock').style.display='none';
   document.getElementById('panel-'+tab).style.display='';
@@ -1855,14 +1856,6 @@ def ranking():
 ADMIN_TABS = {"ops": "대회 운영", "ai": "AI 설정", "users": "아이디 관리", "danger": "삭제"}
 ADMIN_IDLE_SECONDS = 30 * 60      # 탭을 열어둔 채 30분간 아무 요청이 없으면 잠김
 admin_tokens = {}                 # token -> {"tab", "last"}
-_login_fails = {}                 # ip -> [실패 횟수, 잠금 해제 시각]
-LOCK_AFTER_FAILS = 5
-LOCK_SECONDS = 300
-
-
-def _client_ip():
-    fwd = request.headers.get("X-Forwarded-For", "")
-    return (fwd.split(",")[0].strip() if fwd else request.remote_addr) or "?"
 
 
 def _check_admin_code(code):
@@ -1909,16 +1902,8 @@ def admin_unlock():
     tab = data.get("tab")
     if tab not in ADMIN_TABS:
         return jsonify({"error": "알 수 없는 탭입니다."}), 400
-    ip = _client_ip()
-    fails, until = _login_fails.get(ip, [0, 0])
-    if until > time.time():
-        return jsonify({"error": f"코드를 여러 번 틀려 {int(until - time.time())}초 동안 잠겼습니다."}), 429
     if not _check_admin_code(data.get("code")):
-        fails += 1
-        _login_fails[ip] = [0, time.time() + LOCK_SECONDS] if fails >= LOCK_AFTER_FAILS else [fails, 0]
-        left = LOCK_AFTER_FAILS - fails
-        return jsonify({"error": "코드가 틀렸습니다." + (f" ({left}번 더 틀리면 5분 잠김)" if left > 0 else " 5분간 잠깁니다.")}), 403
-    _login_fails.pop(ip, None)
+        return jsonify({"error": "코드가 틀렸습니다."}), 403
     # 오래된 토큰 정리
     now = time.time()
     for t in [t for t, v in admin_tokens.items() if now - v["last"] > ADMIN_IDLE_SECONDS]:
