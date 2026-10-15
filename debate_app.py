@@ -62,6 +62,15 @@ EMPTY_MESSAGE = "(작성 없음)"   # 시간이 끝났는데 아무것도 안 �
 AUTO_NOTE = "⏰ 시간 종료로 자동 제출된 발언 — 작성 중이던 내용 그대로"   # 심사 AI에게 알리는 표시
 SERVER_TIMEOUT_GRACE = 6        # 브라우저 자동 전송이 안 오면 서버가 대신 마감하기까지 여유
 
+# 반론 이후 단계별 발언 순서 (진영 기준)
+# 반론·반박은 찬성 먼저, 최종변론은 반대 먼저 → 찬성(입증 책임이 있는 쪽)이 마지막 말을 한다.
+SPEAK_ORDER = {
+    1: ["찬성", "반대"],   # 반론
+    2: ["찬성", "반대"],   # 반박
+    3: ["반대", "찬성"],   # 최종변론
+}
+
+
 def turn_limit(stage_index, speaker_idx=None):
     """단계별 제한 시간. 입론은 7분(동시 작성), 나머지는 5분."""
     return OPENING_SECONDS if stage_index == 0 else TURN_SECONDS
@@ -825,6 +834,7 @@ def judge_debate(topic, logs):
 - 항목마다 0점부터 배점까지 정수로 매긴다. 만점은 흠잡을 데 없을 때만 준다.
 - 대략 기준: 배점의 90% 이상 = 탁월, 70~80% = 좋음, 50~60% = 보통, 30~40% = 부족, 20% 이하 = 매우 부족.
 - 입론은 두 사람이 서로의 글을 보지 않고 동시에 작성했다. 입론에서 상대를 반박하지 않은 것은 감점하지 않는다.
+- 발언 순서: 반론·반박은 찬성이 먼저, 최종변론은 반대가 먼저 말했다. 나중에 말한 쪽이 상대 글을 보고 썼다는 점을 감안하라.
 - 글이 길다고 점수를 더 주지 않는다. 같은 말 반복은 감점한다.
 - '{AUTO_NOTE}' 표시가 붙은 발언은 제한 시간이 끝나 쓰던 도중에 제출된 것이다. 적힌 내용만으로 채점하되,
   문장이 중간에 끊긴 것 자체를 따로 감점하지는 않는다. 다만 완성되지 않아 전달되지 못한 논지는 점수로 인정하지 않는다.
@@ -980,6 +990,14 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
 @keyframes fadePulse{0%,100%{opacity:.45;}50%{opacity:1;}}
 .summary-item.pending{animation:fadePulse 1.4s ease-in-out infinite;}
 #chat-box{scroll-behavior:smooth;}
+#result-overlay{position:fixed;inset:0;background:rgba(17,24,39,.55);z-index:1000;display:flex;
+  align-items:center;justify-content:center;padding:16px;}
+#result-overlay .result-card{background:#fff;border-radius:14px;max-width:560px;width:100%;max-height:85vh;
+  overflow-y:auto;padding:20px;box-shadow:0 10px 30px rgba(0,0,0,.3);}
+#result-overlay h3{margin:0 0 12px;}
+#result-overlay .result-body{white-space:pre-wrap;line-height:1.6;font-size:0.95em;color:#111827;
+  user-select:text;-webkit-user-select:text;}
+#result-overlay button{width:100%;margin-top:16px;padding:12px;}
 </style>
 </head>
 <body>
@@ -998,6 +1016,7 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
   <p class="stats" id="my-stats"></p>
   <p style="font-size:0.9em;color:#555;">📊 점수는 매 경기 AI 심사 점수(100점 만점)가 승패와 관계없이 누적됩니다.</p>
   <button onclick="joinQueue()" id="match-btn" style="padding:10px 20px;cursor:pointer;background:#2563eb;color:white;border:none;border-radius:6px;font-weight:bold;">토론 매칭 시작</button>
+  <button onclick="cancelQueue()" id="cancel-btn" class="hidden" style="padding:10px 16px;cursor:pointer;background:#fff !important;color:#dc2626 !important;-webkit-text-fill-color:#dc2626;border:1px solid #fca5a5;border-radius:6px;font-weight:bold;">매칭 취소</button>
   <p id="queue-text" style="color:#2563eb;font-weight:bold;margin-top:10px;"></p>
   <p class="nav"><a href="/ranking">🏆 랭킹 보기</a> · <a href="/history">📚 토론 기록</a> · <a href="#" onclick="logout();return false;">로그아웃</a></p>
 </div>
@@ -1181,15 +1200,31 @@ function showOppGone(){stopTimer();
   el.innerText="⏸ 상대 재접속 대기 중 (시계 정지) — 계속 작성해도 됩니다";
   document.getElementById('send-btn').disabled=true;}
 socket.on('opponent_disconnected',()=>{oppGone=true;showOppGone();});
-socket.on('debate_aborted',d=>{stopTimer();clearDrafts();
-  alert("⏹️ 토론이 중단되었습니다.\\n\\n"+d.headline+"\\n\\n"+d.reveal);location.reload();});
+// 결과는 브라우저 alert 대신 화면 안 팝업으로 보여준다.
+// (alert는 탭이 뒤에 있거나 '대화상자 차단'이 켜지면 안 뜨고 바로 넘어갈 수 있다)
+function showResult(title,body){
+  stopTimer();clearDrafts();
+  let ov=document.getElementById('result-overlay');
+  if(!ov){ov=document.createElement('div');ov.id='result-overlay';document.body.appendChild(ov);}
+  ov.innerHTML="<div class='result-card'><h3></h3><div class='result-body'></div>"+
+    "<button id='result-ok'>확인하고 나가기</button></div>";
+  ov.querySelector('h3').textContent=title;
+  ov.querySelector('.result-body').textContent=body;
+  document.getElementById('result-ok').onclick=()=>location.reload();
+  document.title='🔔 '+title;}
+socket.on('debate_aborted',d=>showResult("⏹️ 토론이 중단되었습니다",d.headline+"\\n승패는 기록되지 않았습니다.\\n\\n"+d.reveal));
 socket.on('opponent_reconnected',d=>{oppGone=false;
   setNetBanner('✅ 상대방이 돌아왔습니다 — 시계가 다시 갑니다','#16a34a');
   setTimeout(()=>setNetBanner('',''),2500);
   updateTurnUI(d&&typeof d.seconds_left==='number'?d.seconds_left:remaining);});
 socket.on('error_msg',d=>alert(d.msg));
-function joinQueue(){wantQueue=true;socket.emit('join_queue',{});document.getElementById('match-btn').disabled=true;}
-socket.on('status',d=>{document.getElementById('queue-text').innerText=d.msg;});
+function joinQueue(){wantQueue=true;socket.emit('join_queue',{});document.getElementById('match-btn').disabled=true;
+  document.getElementById('cancel-btn').classList.remove('hidden');}
+function cancelQueue(){wantQueue=false;socket.emit('leave_queue',{});
+  document.getElementById('match-btn').disabled=false;
+  document.getElementById('cancel-btn').classList.add('hidden');
+  document.getElementById('queue-text').innerText='매칭을 취소했습니다.';}
+socket.on('status',d=>{if(wantQueue)document.getElementById('queue-text').innerText=d.msg;});
 // 매칭 버튼이 눌린 채 잠기지 않도록, 방이 안 생겼으면 다시 누를 수 있게 풀어준다
 socket.on('error_msg',()=>{if(!currentRoom&&!wantQueue){
   const b=document.getElementById('match-btn');if(b)b.disabled=false;}});
@@ -1267,8 +1302,7 @@ socket.on('message_rejected',d=>{
   saveDraft();updateLenHint();el.focus();
   startTimer(remaining);});
 document.addEventListener('input',e=>{if(e.target.id==='msg-input'){updateLenHint();saveDraft();}});
-socket.on('surrendered',d=>{stopTimer();clearDrafts();
-  alert("🏳️ 항복했습니다.\\n\\n"+d.headline+"\\n\\n"+d.reveal);location.reload();});
+socket.on('surrendered',d=>showResult("🏳️ 항복했습니다",d.headline+"\\n\\n"+d.reveal));
 function sideClass(side){return side==='찬성'?'pro':(side==='반대'?'con':'');}
 function appendMessage(cb,d,withPending){
   const md=document.createElement('div');md.className='msg-item '+sideClass(d.side);
@@ -1296,9 +1330,8 @@ socket.on('judging',d=>{showJudging(d.msg);
   const cb=document.getElementById('chat-box');
   const el=document.createElement('div');el.className='summary-item pending';
   el.textContent='⚖️ '+d.msg;cb.appendChild(el);cb.scrollTop=cb.scrollHeight;});
-socket.on('opponent_left',d=>{stopTimer();clearDrafts();
-  alert("🚪 몰수승!\\n\\n"+(d.headline||"")+"\\n\\n"+d.reveal);location.reload();});
-socket.on('debate_end',d=>{stopTimer();clearDrafts();alert("🔔 토론 완료!\\n\\n[AI 판정]\\n"+d.result);location.reload();});
+socket.on('opponent_left',d=>showResult("🚪 몰수승!",(d.headline||"")+"\\n\\n"+d.reveal));
+socket.on('debate_end',d=>showResult("🔔 토론 완료 — AI 판정",d.result));
 </script>
 </body></html>"""
 
@@ -2661,7 +2694,7 @@ def start_debate(p1, p2, side_mode="random", topic=""):
     room_id = f"room_{uuid.uuid4().hex[:8]}"
     topic = to_statement(topic) if topic else take_topic()
     now = time.time()
-    rooms[room_id] = {"players": players, "turn_count": 0, "current_speaker": 0,
+    rooms[room_id] = {"players": players, "turn_count": 0, "current_speaker": 0, "turn_pos": 0,
                       "topic": topic, "logs": [], "openings": [None, None],
                       "deadline": now + OPENING_SECONDS, "paused_at": None,
                       "started_at": now}
@@ -2807,21 +2840,32 @@ def submit_speech(room_id, idx, text, auto=False):
             for i, p in enumerate(room['players']):
                 _post_speech(room_id, room, p, room['openings'][i], room['opening_auto'].get(i, False))
             room['turn_count'] = 1
-            room['current_speaker'] = 0
+            room['turn_pos'] = 0
+            room['current_speaker'] = _speaker_index(room)
             room['_stage_changed'] = True
             _advance(room_id, room)
         return None
 
-    # ── 반론 이후: 한 사람씩 번갈아 ──
+    # ── 반론 이후: 단계별로 정해진 진영 순서대로 (SPEAK_ORDER) ──
     if room['current_speaker'] != idx:
         return "지금은 당신의 발언 차례가 아닙니다."
     _post_speech(room_id, room, me, text, auto)
-    if idx == 1:
+    if room.get('turn_pos', 0) == 0:
+        room['turn_pos'] = 1
+    else:
         room['turn_count'] += 1
+        room['turn_pos'] = 0
         room['_stage_changed'] = True
-    room['current_speaker'] = 1 - idx
+    if room['turn_count'] < TOTAL_STAGES:
+        room['current_speaker'] = _speaker_index(room)
     _advance(room_id, room)
     return None
+
+
+def _speaker_index(room):
+    """지금 단계·순번에 말할 진영의 참가자 번호."""
+    side = SPEAK_ORDER[room['turn_count']][room.get('turn_pos', 0)]
+    return next(i for i, p in enumerate(room['players']) if p['side'] == side)
 
 
 @socketio.on('send_message')
