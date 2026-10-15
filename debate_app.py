@@ -1017,13 +1017,17 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
   </details>
 </div>
 <script>
-document.addEventListener('contextmenu',e=>{e.preventDefault();alert('우클릭 금지');});
-document.addEventListener('copy',e=>e.preventDefault());
-document.addEventListener('cut',e=>e.preventDefault());
-document.addEventListener('paste',e=>{e.preventDefault();alert('⚠️ 붙여넣기 금지!');});
-document.addEventListener('drop',e=>e.preventDefault());
-document.addEventListener('dragover',e=>e.preventDefault());
+// 운영자가 관리자 화면에서 '복사·붙여넣기 허용'을 켜면 아래 차단이 모두 풀린다 (테스트용)
+const ALLOW_PASTE={{ 'true' if allow_paste else 'false' }};
+if(ALLOW_PASTE)document.body.style.userSelect='auto';
+document.addEventListener('contextmenu',e=>{if(ALLOW_PASTE)return;e.preventDefault();alert('우클릭 금지');});
+document.addEventListener('copy',e=>{if(!ALLOW_PASTE)e.preventDefault();});
+document.addEventListener('cut',e=>{if(!ALLOW_PASTE)e.preventDefault();});
+document.addEventListener('paste',e=>{if(ALLOW_PASTE)return;e.preventDefault();alert('⚠️ 붙여넣기 금지!');});
+document.addEventListener('drop',e=>{if(!ALLOW_PASTE)e.preventDefault();});
+document.addEventListener('dragover',e=>{if(!ALLOW_PASTE)e.preventDefault();});
 document.addEventListener('beforeinput',e=>{
+  if(ALLOW_PASTE)return;
   if(e.inputType==='insertFromPaste'||e.inputType==='insertFromDrop'||e.inputType==='insertFromPasteAsQuotation'){
     e.preventDefault();alert('⚠️ 붙여넣기 금지!');
   }
@@ -1035,6 +1039,7 @@ document.addEventListener('keydown',e=>{
     if(btn&&!btn.disabled)sendMessage();
     return;}
   if(isCtrl&&key==='a'&&isTyping)return;
+  if(ALLOW_PASTE)return;
   if(isCtrl&&['c','v','x','a'].includes(key)){e.preventDefault();alert('⚠️ 단축키 금지!');}
 });
 const socket=io({reconnection:true,reconnectionAttempts:Infinity,
@@ -1372,6 +1377,9 @@ button:disabled{opacity:.5;cursor:not-allowed;}
       <span id="auto-label">자동(랜덤) 매칭</span></label>
     <p class="hint">켜면: 대기실에 들어온 사람끼리 랜덤으로 붙습니다 (예약된 사람은 제외).<br>
     끄면: 대기실에 쌓이기만 하고, 아래에서 운영자가 직접 붙입니다. 토너먼트 때는 끄세요.</p>
+    <label class="switch" style="margin-top:8px;"><input type="checkbox" id="allow-paste" onchange="setPaste(this.checked)">
+      <span id="paste-label">복사·붙여넣기 허용 (테스트용)</span></label>
+    <p class="hint">테스트할 때만 켜세요. <b>대회 전에 반드시 끄기.</b> 바꾼 뒤 참가자가 새로고침해야 적용됩니다.</p>
   </div>
 
   <div class="box">
@@ -1550,6 +1558,9 @@ async function refreshOps(){
   let d;try{d=await api('ops/state');}catch(e){return;}
   opsState=d;
   const am=document.getElementById('auto-match');am.checked=d.auto_match;
+  const ap=document.getElementById('allow-paste');ap.checked=d.allow_paste;
+  document.getElementById('paste-label').innerHTML=d.allow_paste?
+    "복사·붙여넣기 <b style='color:#dc2626;'>허용 중 ⚠️ 대회 전에 끄세요</b>":"복사·붙여넣기 허용 (테스트용) — 지금은 금지";
   document.getElementById('auto-label').textContent='자동(랜덤) 매칭 '+(d.auto_match?'켜짐':'꺼짐 — 운영자 배정');
   document.getElementById('wait-count').textContent='('+d.waiting.length+'명)';
   const pa=document.getElementById('pa').value,pb=document.getElementById('pb').value;
@@ -1580,6 +1591,7 @@ function pairBody(){return {a:document.getElementById('pa').value.trim(),b:docum
 async function pairNow(){try{await api('ops/pair',pairBody());clearPair();}catch(e){}refreshOps();}
 async function reserve(){try{await api('ops/reserve',pairBody());clearPair();}catch(e){}refreshOps();}
 async function unreserve(id){try{await api('ops/unreserve',{id});}catch(e){}refreshOps();}
+async function setPaste(on){try{await api('ops/paste',{on});}catch(e){}refreshOps();}
 async function setAuto(on){try{await api('ops/auto',{on});}catch(e){}refreshOps();}
 
 function renderPending(list){
@@ -1805,7 +1817,8 @@ HISTORY_TEMPLATE = """<!DOCTYPE html>
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE, engine_name=get_active_name(),
-                                  turn_seconds=TURN_SECONDS, min_length=MIN_MESSAGE_LENGTH)
+                                  turn_seconds=TURN_SECONDS, min_length=MIN_MESSAGE_LENGTH,
+                                  allow_paste=paste_allowed())
 
 
 @app.route('/history')
@@ -1924,6 +1937,10 @@ def admin_lock():
 # ─────────────────────────────────────────────
 # 관리자 — 대회 운영 탭
 # ─────────────────────────────────────────────
+def paste_allowed():
+    return get_setting("allow_paste", "0") == "1"
+
+
 def auto_match_on():
     return get_setting("auto_match", "1") != "0"
 
@@ -2001,6 +2018,7 @@ def ops_state(data):
     reserved = reserved_usernames()
     return jsonify({
         "auto_match": auto_match_on(),
+        "allow_paste": paste_allowed(),
         "waiting": [{"username": p["username"], "wait_sec": int(now - p.get("since", now)),
                      "reserved": p["username"] in reserved} for p in waiting_pool],
         "reservations": get_reservations(),
@@ -2019,6 +2037,15 @@ def ops_auto(data):
     if on:
         try_match()
     return jsonify({"ok": True, "msg": "자동(랜덤) 매칭 " + ("켜짐" if on else "꺼짐")})
+
+
+@app.route('/admin/api/ops/paste', methods=['POST'])
+@admin_api("ops")
+def ops_paste(data):
+    on = bool(data.get("on"))
+    set_setting("allow_paste", "1" if on else "0")
+    return jsonify({"ok": True, "msg": "복사·붙여넣기 " + ("허용 (테스트용)" if on else "금지")
+                    + " — 참가자가 새로고침하면 적용됩니다"})
 
 
 SIDE_MODES = ("random", "a_pro", "a_con")
