@@ -58,7 +58,8 @@ TOTAL_STAGES = len(STAGES)
 TURN_SECONDS = 300              # 기본 발언 시간
 OPENING_SECONDS = 420           # 입론 — 두 사람이 동시에 7분 동안 작성
 MIN_MESSAGE_LENGTH = 30        # 이보다 짧은 발언은 반려한다
-TIMEOUT_MESSAGE = "(시간 초과)"  # 시간 초과 자동 전송은 길이 검사에서 예외
+EMPTY_MESSAGE = "(작성 없음)"   # 시간이 끝났는데 아무것도 안 썼을 때
+AUTO_NOTE = "⏰ 시간 종료로 자동 제출된 발언 — 작성 중이던 내용 그대로"   # 심사 AI에게 알리는 표시
 SERVER_TIMEOUT_GRACE = 6        # 브라우저 자동 전송이 안 오면 서버가 대신 마감하기까지 여유
 
 def turn_limit(stage_index, speaker_idx=None):
@@ -66,12 +67,25 @@ def turn_limit(stage_index, speaker_idx=None):
     return OPENING_SECONDS if stage_index == 0 else TURN_SECONDS
 
 
-JUDGE_CRITERIA = [
-    ("입론", "논지의 명확성과 근거의 타당성"),
-    ("반론", "상대 논리의 허점을 정확히 짚어내는 능력"),
-    ("반박", "반론에 대한 재반박의 논리성"),
-    ("최종변론", "전체 논지 정리와 설득력"),
+# 심사 기준 — 100점 만점 (단계당 25점, 세부 항목별 채점)
+# (키, 항목 이름, 배점)
+RUBRIC = [
+    ("입론", [("op_claim", "논지의 명확성", 10),
+              ("op_evidence", "근거의 타당성·구체성", 10),
+              ("op_form", "구성과 전달력", 5)]),
+    ("반론", [("rb_target", "상대 논리의 핵심 허점 포착", 10),
+              ("rb_evidence", "반론 근거의 타당성", 10),
+              ("rb_form", "구성과 전달력", 5)]),
+    ("반박", [("rr_answer", "받은 반론에 대한 직접 대응", 10),
+              ("rr_logic", "재반박의 논리성", 10),
+              ("rr_reinforce", "자기 논지 보강", 5)]),
+    ("최종변론", [("cl_summary", "전체 논지 정리", 10),
+                ("cl_persuasion", "설득력", 10),
+                ("cl_compare", "상대 대비 우위 제시", 5)]),
 ]
+TOTAL_POINTS = sum(pts for _, items in RUBRIC for _, _, pts in items)
+JUDGE_CRITERIA = [(stage, " · ".join(f"{name} {pts}" for _, name, pts in items))
+                  for stage, items in RUBRIC]
 
 ADMIN_CODE = os.environ.get("DEBATE_ADMIN_CODE", "1234")
 TEST_MODE = "테스트 모드"
@@ -737,23 +751,50 @@ def draws_allowed():
 
 def _judge_schema(allow_draw):
     winners = ["찬성", "반대"] + (["무승부"] if allow_draw else [])
+    item_keys = [k for _, items in RUBRIC for k, _, _ in items]
+    side_obj = {"type": "object", "additionalProperties": False, "required": item_keys,
+                "properties": {k: {"type": "integer"} for k in item_keys}}
     return {
         "name": "debate_verdict",
         "strict": True,
         "schema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["winner", "score_pro", "score_con", "reason", "no_will_side", "no_will_reason"],
+            "required": ["pro", "con", "winner", "reason", "no_will_side", "no_will_reason"],
             "properties": {
+                "pro": side_obj,
+                "con": side_obj,
                 "winner": {"type": "string", "enum": winners},
-                "score_pro": {"type": "integer"},
-                "score_con": {"type": "integer"},
                 "reason": {"type": "string"},
                 "no_will_side": {"type": "string", "enum": ["없음", "찬성", "반대", "둘다"]},
                 "no_will_reason": {"type": "string"},
             },
         },
     }
+
+
+def _score_side(raw):
+    """AI가 준 항목 점수를 배점 범위로 자르고, 단계별·총점은 서버가 직접 계산한다."""
+    raw = raw or {}
+    stages, total = [], 0
+    for stage, items in RUBRIC:
+        sub = 0
+        for key, _, pts in items:
+            try:
+                v = int(raw.get(key, 0))
+            except (TypeError, ValueError):
+                v = 0
+            sub += max(0, min(pts, v))
+        stages.append((stage, sub))
+        total += sub
+    return total, stages
+
+
+def _log_line(log):
+    line = f"[{log['stage']}] {log['side']}: {log['text']}"
+    if log.get('auto') and log['text'] != EMPTY_MESSAGE:
+        line += f"\n   ({AUTO_NOTE})"
+    return line
 
 
 def judge_debate(topic, logs):
@@ -763,18 +804,33 @@ def judge_debate(topic, logs):
     실패하면 ok=False, winner='심사실패'.
     """
     allow_draw = draws_allowed()
-    log_text = "\n".join([f"[{log['stage']}] {log['side']}: {log['text']}" for log in logs])
-    draw_rule = ("- 실력이 정말 대등할 때만 '무승부'를 줄 수 있다."
+    log_text = "\n".join(_log_line(l) for l in logs)
+    rubric_text = "\n".join(
+        f"{i}. {stage} (25점)\n" + "\n".join(f"   - {key}: {name} — {pts}점 만점" for key, name, pts in items)
+        for i, (stage, items) in enumerate(RUBRIC, start=1))
+    draw_rule = ("- 총점이 같고 실력이 정말 대등할 때만 winner를 '무승부'로 할 수 있다."
                  if allow_draw else
-                 "- 이 대회는 토너먼트라 무승부가 없다. 점수가 같더라도 조금이라도 나은 쪽을 반드시 승자로 정하라.")
-    prompt = f"""너는 고등학교 토론 동아리의 심사위원이다. 아래 1대1 찬반 토론을 단계별 심사 기준에 따라 엄격히 평가하라.
+                 "- 이 대회는 토너먼트라 무승부가 없다. winner는 반드시 '찬성' 또는 '반대'다. "
+                 "총점이 같을 때 이 값으로 승자를 정하므로, 조금이라도 나은 쪽을 고르라.")
+    prompt = f"""너는 고등학교 토론 동아리의 심사위원이다. 아래 1대1 찬반 토론을 세부 항목별로 엄격하고 일관되게 채점하라.
 
-[심사 기준 — 단계당 5점 만점, 총 20점]
-1. 입론: 논지의 명확성과 근거의 타당성 (입론은 두 사람이 서로의 글을 보지 않고 동시에 작성했다)
-2. 반론: 상대 논리의 허점을 정확히 짚어내는 능력
-3. 반박: 반론에 대한 재반박의 논리성
-4. 최종변론: 전체 논지 정리와 설득력
-- '(시간 초과)'로 적힌 발언은 그 단계 0점이다.
+[채점표 — 100점 만점, 찬성(pro)과 반대(con)를 각각 채점]
+{rubric_text}
+
+[채점 원칙]
+- 항목마다 0점부터 배점까지 정수로 매긴다. 만점은 흠잡을 데 없을 때만 준다.
+- 대략 기준: 배점의 90% 이상 = 탁월, 70~80% = 좋음, 50~60% = 보통, 30~40% = 부족, 20% 이하 = 매우 부족.
+- 입론은 두 사람이 서로의 글을 보지 않고 동시에 작성했다. 입론에서 상대를 반박하지 않은 것은 감점하지 않는다.
+- 글이 길다고 점수를 더 주지 않는다. 같은 말 반복은 감점한다.
+- '{AUTO_NOTE}' 표시가 붙은 발언은 제한 시간이 끝나 쓰던 도중에 제출된 것이다. 적힌 내용만으로 채점하되,
+  문장이 중간에 끊긴 것 자체를 따로 감점하지는 않는다. 다만 완성되지 않아 전달되지 못한 논지는 점수로 인정하지 않는다.
+- '{EMPTY_MESSAGE}'로 적힌 발언은 그 단계 모든 항목 0점이다.
+
+[상대 주장의 재구성(허수아비 공격)]
+- 입론·반론·반박 단계에서 상대 주장을 자기에게 유리하게 재구성해 공격하는 것은 토론 기술로 보고 감점하지 않는다.
+- 대신 상대가 그 왜곡을 정확히 지적해 무너뜨리면, 지적한 쪽의 해당 항목(허점 포착·직접 대응·재반박)을 높게 평가한다.
+- 단, 최종변론에서 처음 꺼낸 왜곡은 상대가 반박할 기회가 없으므로 점수로 인정하지 않는다 (감점은 하지 않는다).
+
 {draw_rule}
 
 [토론 의지 없음 판정 — 매우 보수적으로]
@@ -783,7 +839,7 @@ def judge_debate(topic, logs):
 - 의미 없는 글자·같은 문장 반복 등으로 글자 수만 채웠다
 - 자기 진영과 반대되는 주장을 일부러 펼쳐 토론을 망쳤다
 다음은 절대 해당하지 않는다: 논리가 약함, 근거가 부족함, 엉뚱하거나 서툰 주장, 맞춤법 실수,
-짧지만 주제에 대해 성실히 쓴 발언, 시간 초과가 몇 번 있었던 경우.
+짧지만 주제에 대해 성실히 쓴 발언, 시간이 끝나 자동 제출되거나 비어 있는 발언이 몇 번 있었던 경우.
 조금이라도 애매하면 '없음'으로 하라. 해당하면 no_will_reason에 구체적인 발언을 근거로 한 문장으로 쓰고,
 해당하지 않으면 no_will_reason은 빈 문자열로 둔다.
 
@@ -791,9 +847,8 @@ def judge_debate(topic, logs):
 [토론 로그 — 단계 순서대로]
 {log_text}
 
-반드시 아래 JSON 형식으로만 답하라.
-{{"winner": "찬성" 또는 "반대"{' 또는 "무승부"' if allow_draw else ''}, "score_pro": 총점숫자, "score_con": 총점숫자,
- "reason": "단계별 근거를 포함해 4문장 이내로", "no_will_side": "없음"/"찬성"/"반대"/"둘다", "no_will_reason": ""}}"""
+reason에는 승패를 가른 결정적 차이를 단계별 근거와 함께 5문장 이내로 쓴다.
+반드시 지정된 JSON 형식으로만 답하라. pro와 con에는 위 채점표의 키마다 정수 점수를 넣는다."""
     schema = _judge_schema(allow_draw)
     last_error = ""
     for attempt in range(3):
@@ -801,17 +856,33 @@ def judge_debate(topic, logs):
         try:
             raw = llm_call(prompt, raise_errors=True, json_schema=schema)
             data = json.loads(raw.replace("```json", "").replace("```", "").strip())
-            winner = data.get("winner", "")
-            valid = ("찬성", "반대", "무승부") if allow_draw else ("찬성", "반대")
-            if winner not in valid:
-                raise ValueError(f"알 수 없는 판정값: {winner}")
+            if not isinstance(data.get("pro"), dict) or not isinstance(data.get("con"), dict):
+                raise ValueError("항목별 점수가 없습니다")
+            pro_total, pro_stages = _score_side(data["pro"])
+            con_total, con_stages = _score_side(data["con"])
+            # 승자는 서버가 계산한 총점으로 정한다. 동점일 때만 AI의 판단(winner)을 따른다.
+            if pro_total > con_total:
+                winner = "찬성"
+            elif con_total > pro_total:
+                winner = "반대"
+            else:
+                ai_pick = data.get("winner", "")
+                if allow_draw and ai_pick == "무승부":
+                    winner = "무승부"
+                elif ai_pick in ("찬성", "반대"):
+                    winner = ai_pick
+                else:
+                    winner = "무승부" if allow_draw else random.choice(["찬성", "반대"])
             no_will = data.get("no_will_side", "없음")
             if no_will not in ("없음", "찬성", "반대", "둘다"):
                 no_will = "없음"
             log_ai_call("심사", True, "", (time.time() - started) * 1000)
             verdict_line = f"판정: {winner}측 승리" if winner != "무승부" else "판정: 무승부"
-            text = (verdict_line + "\n" +
-                    f"점수: 찬성 {data.get('score_pro','?')}점 vs 반대 {data.get('score_con','?')}점 (20점 만점)\n" +
+            tie_note = " (동점 — 세부 내용으로 승자 결정)" if pro_total == con_total and winner != "무승부" else ""
+            stage_line = " · ".join(f"{st} {p}:{c}" for (st, p), (_, c) in zip(pro_stages, con_stages))
+            text = (f"{verdict_line}{tie_note}\n"
+                    f"점수: 찬성 {pro_total}점 vs 반대 {con_total}점 ({TOTAL_POINTS}점 만점)\n"
+                    f"단계별(찬성:반대, 각 25점): {stage_line}\n"
                     f"근거: {data.get('reason','근거 없음')}")
             return {"ok": True, "winner": winner, "text": text,
                     "no_will_side": no_will, "no_will_reason": data.get("no_will_reason", "")}
@@ -1009,12 +1080,20 @@ function updateTimerText(){const el=document.getElementById('turn-status');
     return;}
   if(myTurn){el.innerText=(remaining<=30?"🚨":"⏰")+" 당신의 발언 차례입니다! (남은 시간 "+clockText()+")";}
   else{el.innerText="⏳ 상대방 발언 중 — 남은 시간 "+clockText()+" · 미리 작성해두세요";}}
-function autoSend(){const i=document.getElementById('msg-input');
-  if(i.value.trim().length<minLength)i.value="(시간 초과)";sendMessage(true);}
+// 시간이 끝나면 쓰던 내용을 길이와 상관없이 그대로 제출한다
+function autoSend(){const el=document.getElementById('msg-input');
+  stopTimer();
+  socket.emit('send_message',{room_id:currentRoom,message:el.value.trim(),auto:true});
+  el.value="";saveDraft();updateLenHint();}
+// 작성 중인 글을 몇 초마다 서버에도 보관 — 화면이 꺼져도 서버가 대신 제출할 수 있게
+let lastDraftSent=null;
+setInterval(()=>{if(!currentRoom||!socket.connected)return;
+  const v=document.getElementById('msg-input').value;
+  if(v!==lastDraftSent){lastDraftSent=v;socket.emit('draft',{room_id:currentRoom,text:v});}},3000);
 function renderCriteria(list){
   if(!list||!list.length)return;
   const box=document.getElementById('criteria-box');
-  box.innerHTML='<b>📋 AI 심사 기준</b> — 단계당 5점, 총 20점<br>'+
+  box.innerHTML='<b>📋 AI 심사 기준</b> — 단계당 25점, 총 100점<br>'+
     list.map(c=>"<span class='ct'>"+c.stage+"</span> "+c.desc).join('<br>')+
     '<br><span style="color:#9ca3af;">※ 주제와 무관한 내용·장난으로 일관하면 운영자 확인 후 몰수패가 될 수 있습니다.</span>';}
 function updateLenHint(){const v=document.getElementById('msg-input').value.trim();
@@ -1182,7 +1261,9 @@ function appendMessage(cb,d,withPending){
   ne.innerHTML="<span class='stage-label'>["+d.stage+"]</span> "+whoTag(d.side)+" ";
   const te=document.createElement('span');te.textContent=d.message;
   md.appendChild(ne);md.appendChild(te);cb.appendChild(md);
-  if(withPending&&d.message!=='(시간 초과)'){const sd=document.createElement('div');
+  if(d.auto){const tag=document.createElement('div');tag.className='summary-item';
+    tag.textContent='⏰ 시간 종료로 자동 제출됨';md.appendChild(tag);}
+  if(withPending&&d.message!=='(작성 없음)'){const sd=document.createElement('div');
     sd.className='summary-item pending '+sideClass(d.side);
     sd.id='sum-'+d.msg_id;sd.textContent='🤖 AI 요약 생성 중...';cb.appendChild(sd);}}
 socket.on('receive_message',d=>{const cb=document.getElementById('chat-box');
@@ -2412,7 +2493,7 @@ def _seat_in_room(username, sid):
         'speaker_side': room['players'][room['current_speaker']]['side'],
         'criteria': [{'stage': s, 'desc': d} for s, d in JUDGE_CRITERIA],
         'min_length': MIN_MESSAGE_LENGTH,
-        'logs': [{'side': l['side'], 'stage': l['stage'], 'message': l['text']} for l in room['logs']],
+        'logs': [{'side': l['side'], 'stage': l['stage'], 'message': l['text'], 'auto': l.get('auto', False)} for l in room['logs']],
     }, room=sid)
     if opp.get('connected', True):
         socketio.emit('opponent_reconnected', {'seconds_left': seconds_left(room)}, room=opp['sid'])
@@ -2619,18 +2700,18 @@ def judge_in_background(room_id):
     close_room(room_id)
 
 
-def _post_speech(room_id, room, speaker, text):
-    """발언 하나를 기록하고 양쪽·관전자에게 보낸다."""
+def _post_speech(room_id, room, speaker, text, auto=False):
+    """발언 하나를 기록하고 양쪽·관전자에게 보낸다. auto=시간 종료로 자동 제출된 것."""
     stage_name = STAGES[min(room['turn_count'], TOTAL_STAGES - 1)]
     msg_id = uuid.uuid4().hex[:12]
-    room['logs'].append({"side": speaker['side'], "stage": stage_name, "text": text})
-    socketio.emit('receive_message', {'side': speaker['side'],
+    room['logs'].append({"side": speaker['side'], "stage": stage_name, "text": text, "auto": auto})
+    socketio.emit('receive_message', {'side': speaker['side'], 'auto': auto,
                                       'message': text, 'msg_id': msg_id, 'stage': stage_name},
                   room=room_id)
     socketio.emit('admin_message', {'room_id': room_id, 'side': speaker['side'], 'msg_id': msg_id,
-                                    'username': speaker['username'],
+                                    'username': speaker['username'], 'auto': auto,
                                     'message': text, 'stage': stage_name}, room=f"watch_{room_id}")
-    if text != TIMEOUT_MESSAGE:
+    if text != EMPTY_MESSAGE:
         socketio.start_background_task(summarize_in_background, room_id, msg_id, text)
 
 
@@ -2658,21 +2739,24 @@ def _advance(room_id, room):
     room['_stage_changed'] = False
 
 
-def submit_speech(room_id, idx, text):
+def submit_speech(room_id, idx, text, auto=False):
     """
-    발언 제출 (사람이 보낸 것이든 서버가 시간 초과로 대신 낸 것이든 같은 길로 처리).
+    발언 제출 (사람이 보낸 것이든 시간 종료로 자동 제출된 것이든 같은 길로 처리).
     반환: 오류 문구 또는 None
     """
     room = rooms.get(room_id)
     if not room or room.get('judging'):
         return "진행 중인 토론이 아닙니다."
     me = room['players'][idx]
+    text = (text or "").strip() or EMPTY_MESSAGE
+    room.setdefault('drafts', {}).pop(idx, None)
 
     # ── 입론: 두 사람이 동시에 쓰고, 둘 다 내면(또는 시간이 끝나면) 함께 공개 ──
     if room['turn_count'] == 0:
         if room['openings'][idx] is not None:
             return "이미 입론을 제출했습니다."
         room['openings'][idx] = text
+        room.setdefault('opening_auto', {})[idx] = auto
         socketio.emit('opening_submitted', {}, room=me['sid'])
         opp = room['players'][1 - idx]
         socketio.emit('opp_opening_submitted', {}, room=opp['sid'])
@@ -2681,7 +2765,7 @@ def submit_speech(room_id, idx, text):
                       room=f"watch_{room_id}")
         if all(o is not None for o in room['openings']):
             for i, p in enumerate(room['players']):
-                _post_speech(room_id, room, p, room['openings'][i])
+                _post_speech(room_id, room, p, room['openings'][i], room['opening_auto'].get(i, False))
             room['turn_count'] = 1
             room['current_speaker'] = 0
             room['_stage_changed'] = True
@@ -2691,7 +2775,7 @@ def submit_speech(room_id, idx, text):
     # ── 반론 이후: 한 사람씩 번갈아 ──
     if room['current_speaker'] != idx:
         return "지금은 당신의 발언 차례가 아닙니다."
-    _post_speech(room_id, room, me, text)
+    _post_speech(room_id, room, me, text, auto)
     if idx == 1:
         room['turn_count'] += 1
         room['_stage_changed'] = True
@@ -2704,28 +2788,40 @@ def submit_speech(room_id, idx, text):
 def handle_send_message(data):
     room_id = data.get('room_id')
     msg_text = (data.get('message') or '').strip()
+    auto = bool(data.get('auto'))       # 시간이 끝나 브라우저가 쓰던 내용을 그대로 보낸 것
     room = rooms.get(room_id)
-    if not room or not msg_text:
+    if not room or (not msg_text and not auto):
         return
     idx = next((i for i, p in enumerate(room['players']) if p['sid'] == request.sid), None)
     if idx is None:
         emit('error_msg', {'msg': '이 토론의 참가자가 아닙니다. 새로고침해주세요.'})
         return
-    # 너무 짧은 발언은 반려한다 (시간 초과 자동 전송은 예외)
-    if msg_text != TIMEOUT_MESSAGE and len(msg_text) < MIN_MESSAGE_LENGTH:
+    # 너무 짧은 발언은 반려한다 (시간 종료 자동 제출은 길이와 상관없이 그대로 받는다)
+    if not auto and len(msg_text) < MIN_MESSAGE_LENGTH:
         emit('message_rejected', {
             'msg': f'발언이 너무 짧습니다. 최소 {MIN_MESSAGE_LENGTH}자 이상 작성해주세요.',
             'text': msg_text, 'length': len(msg_text), 'required': MIN_MESSAGE_LENGTH})
         return
-    err = submit_speech(room_id, idx, msg_text)
-    if err:
+    err = submit_speech(room_id, idx, msg_text, auto)
+    if err and not auto:
         emit('error_msg', {'msg': err})
+
+
+@socketio.on('draft')
+def handle_draft(data):
+    """작성 중인 글을 서버에 보관 — 화면이 꺼져 자동 제출이 안 와도 서버가 이걸 대신 제출한다."""
+    room = rooms.get((data or {}).get('room_id'))
+    if not room:
+        return
+    idx = next((i for i, p in enumerate(room['players']) if p['sid'] == request.sid), None)
+    if idx is not None:
+        room.setdefault('drafts', {})[idx] = (data.get('text') or '')[:20000]
 
 
 def deadline_watcher():
     """
     브라우저가 잠들거나(모바일 화면 꺼짐) 자동 전송을 못 보내도 토론이 멈추지 않도록,
-    마감이 지난 차례는 서버가 '(시간 초과)'로 마감한다. 누가 끊겨 시계가 멈춘 방은 건드리지 않는다.
+    마감이 지난 차례는 서버가 마지막으로 받은 초안을 자동 제출한다. 누가 끊겨 시계가 멈춘 방은 건드리지 않는다.
     """
     while True:
         socketio.sleep(2)
@@ -2739,9 +2835,10 @@ def deadline_watcher():
                 if room['turn_count'] == 0:
                     for i in (0, 1):
                         if rooms.get(room_id) and room['openings'][i] is None and room['turn_count'] == 0:
-                            submit_speech(room_id, i, TIMEOUT_MESSAGE)
+                            submit_speech(room_id, i, room.get('drafts', {}).get(i, ''), auto=True)
                 else:
-                    submit_speech(room_id, room['current_speaker'], TIMEOUT_MESSAGE)
+                    i = room['current_speaker']
+                    submit_speech(room_id, i, room.get('drafts', {}).get(i, ''), auto=True)
         except Exception as e:
             print(f"[마감 감시 오류] {type(e).__name__}: {e}")
 
