@@ -105,25 +105,6 @@ BACKUP_TOPICS = [
     "유명인의 사생활 보도는 더 엄격히 제한해야 한다.",
 ]
 
-ALIAS_POOL = [
-    "대한민국의 첫 번째 왕좌를 차지한 자", "왕좌를 놓지 않는 건국의 노인",
-    "왕좌에서 내려오기를 끝까지 거부한 노회한 독재자", "한강의 다리를 건너간 도망의 성자",
-    "한강의 기적을 설계한 철권의 통치자", "산업화를 명령한 철의 군인",
-    "유신의 밤을 밝힌 철의 군주", "반신의 왕좌에 앉은 재규어의 그림자",
-    "긴 세월을 다스린 강철의 아버지", "강철 전차를 몰고 온 새벽의 장군",
-    "군홧발로 권력을 장악한 철의 사내", "헌법보다 총을 믿었던 자",
-    "광주의 밤을 가로지른 불의 성좌", "친구 따라 청와대까지 걸어간 자",
-    "친구와 함께 쿠데타하고 민주화를 선언한 자", "세 당을 하나로 묶은 중재의 그림자",
-    "문민의 깃발을 휘두른 거인", "외환의 폭풍을 맞은 항해자",
-    "햇볕을 내려준 호남의 대부", "남북의 다리를 놓은 DJ의 성좌",
-    "권위주의의 벽을 넘어선 시민의 대통령", "반미의 깃발을 들고 부시의 전쟁에 병사를 보낸 자",
-    "이라크의 밤하늘에 한국군의 그림자를 남긴 자", "거인의 어깨 위에서 뛰어내린 청계천의 주인",
-    "한반도의 4대 강을 지배하는 자", "청와대로 돌아온 공주",
-    "수첩에 적은 운명을 따른 공주", "촛불의 파도 위에 선 자",
-    "탈원전의 밤을 선포한 녹색의 군주", "빨간 버튼을 어루만진 검사의 성좌",
-    "여섯 시간의 겨울을 선포한 윤의 별", "대출의 문을 잠근 재이의 성좌",
-    "형수의 목소리를 남긴 찢어진 별",
-]
 
 
 # ─────────────────────────────────────────────
@@ -929,7 +910,7 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
 <h2>🗣️ 동아리 익명 1대1 토론 시스템</h2>
 <p class="engine-tag">🤖 현재 AI 엔진: {{ engine_name }}</p>
 <div id="login-area" class="box">
-  <p style="font-size:0.9em;color:#555;">운영자가 발급한 아이디로 로그인하세요.<br>🎭 토론 중에는 익명 이름만 표시됩니다.</p>
+  <p style="font-size:0.9em;color:#555;">운영자가 발급한 아이디로 로그인하세요.<br>🎭 토론 중에는 상대가 누구인지 공개되지 않습니다 (끝나면 공개).</p>
   <input type="text" id="username" placeholder="아이디" style="padding:8px;width:40%;">
   <input type="password" id="pin" placeholder="PIN" style="padding:8px;width:35%;">
   <button onclick="login()" style="padding:8px 15px;cursor:pointer;">로그인</button>
@@ -992,7 +973,6 @@ let opening=false,myOpeningDone=false,oppOpeningDone=false;
 let wantQueue=false,kicked=false;
 const TIMER_SECONDS={{ turn_seconds }};
 let timerInterval=null,remaining=TIMER_SECONDS,deadlineAt=0,minLength={{ min_length }};
-let speakerAlias="",speakerSide="";
 // 새로고침해도 이어지도록 접속 토큰과 작성 중인 초안을 브라우저에 보관한다
 function store(k,v){try{if(v===null)localStorage.removeItem(k);else localStorage.setItem(k,v);}catch(e){}}
 function load(k){try{return localStorage.getItem(k);}catch(e){return null;}}
@@ -1084,8 +1064,8 @@ socket.on('resumed',d=>{
   document.getElementById('profile-area').classList.add('hidden');
   document.getElementById('debate-area').classList.remove('hidden');
   document.getElementById('topic-area').innerText="📌 주제: "+d.topic;
-  mySide=d.my_side;oppSide=d.opp_side;myAlias=d.my_alias;oppAlias=d.opp_alias;
-  document.getElementById('role-area').innerHTML="🎭 내 이름: ["+d.my_alias+"] "+whoTag(d.my_side)+"  vs  상대: ["+d.opp_alias+"] "+whoTag(d.opp_side);
+  mySide=d.my_side;oppSide=d.opp_side;
+  document.getElementById('role-area').innerHTML="나: "+whoTag(d.my_side)+"  vs  상대: "+whoTag(d.opp_side);
   renderSideBanner(d.topic);
   if(d.min_length)minLength=d.min_length;
   renderCriteria(d.criteria);
@@ -1128,7 +1108,7 @@ function showStage(stageName,idx,total,animate){
   banner.textContent='📍 현재 단계: '+stageName+(idx===0?' (동시 작성)':'')+' ('+(idx+1)+'/'+total+')';
   renderStageDots(idx,total);
   if(animate){banner.classList.remove('stage-pulse');void banner.offsetWidth;banner.classList.add('stage-pulse');}}
-let mySide="",oppSide="",myAlias="",oppAlias="";
+let mySide="",oppSide="";
 function sideTag(side){return "<span class='side-tag "+(side==='찬성'?'side-pro':'side-con')+"'>"+side+"</span>";}
 // 채팅에서 [찬성(나)] / [반대(상대)] 로 표시
 function whoTag(side){
@@ -1149,9 +1129,9 @@ socket.on('match_found',d=>{currentRoom=d.room_id;myTurn=d.your_turn;totalStages
   if(d.min_length)minLength=d.min_length;
   document.getElementById('profile-area').classList.add('hidden');
   document.getElementById('debate-area').classList.remove('hidden');
-  mySide=d.my_side;oppSide=d.opp_side;myAlias=d.my_alias;oppAlias=d.opp_alias;
+  mySide=d.my_side;oppSide=d.opp_side;
   document.getElementById('topic-area').innerText="📌 주제: "+d.topic;
-  document.getElementById('role-area').innerHTML="🎭 내 이름: ["+d.my_alias+"] "+whoTag(d.my_side)+"  vs  상대: ["+d.opp_alias+"] "+whoTag(d.opp_side);
+  document.getElementById('role-area').innerHTML="나: "+whoTag(d.my_side)+"  vs  상대: "+whoTag(d.opp_side);
   renderSideBanner(d.topic);
   renderCriteria(d.criteria);
   document.getElementById('chat-box').innerHTML='';
@@ -1161,7 +1141,6 @@ socket.on('match_found',d=>{currentRoom=d.room_id;myTurn=d.your_turn;totalStages
 socket.on('opening_submitted',()=>{myOpeningDone=true;updateTurnUI(remaining);});
 socket.on('opp_opening_submitted',()=>{oppOpeningDone=true;updateTimerText();});
 socket.on('turn_change',d=>{myTurn=d.your_turn;opening=false;
-  speakerAlias=d.speaker_alias;speakerSide=d.speaker_side;
   showStage(d.stage,d.stage_index,totalStages,d.stage_changed);
   updateTurnUI(d.seconds_left);});
 function updateTurnUI(seconds){const area=document.getElementById('debate-area'),
@@ -1200,8 +1179,7 @@ function sideClass(side){return side==='찬성'?'pro':(side==='반대'?'con':'')
 function appendMessage(cb,d,withPending){
   const md=document.createElement('div');md.className='msg-item '+sideClass(d.side);
   const ne=document.createElement('strong');
-  ne.innerHTML="<span class='stage-label'>["+d.stage+"]</span> "+whoTag(d.side)+
-               " <span style='color:#9ca3af;font-weight:normal;'>"+d.sender+"</span>: ";
+  ne.innerHTML="<span class='stage-label'>["+d.stage+"]</span> "+whoTag(d.side)+" ";
   const te=document.createElement('span');te.textContent=d.message;
   md.appendChild(ne);md.appendChild(te);cb.appendChild(md);
   if(withPending&&d.message!=='(시간 초과)'){const sd=document.createElement('div');
@@ -1583,8 +1561,8 @@ function addLine(roomId,text,cls){const box=document.getElementById('chat-'+room
 function sideCls(s){return s==='찬성'?'pro':'con';}
 wsocket.on('admin_history',d=>{const box=document.getElementById('chat-'+d.room_id);if(!box)return;box.innerHTML='';
   if(!d.logs.length)addLine(d.room_id,'아직 공개된 발언이 없습니다. (입론은 둘 다 내면 함께 공개)','sum');
-  d.logs.forEach(l=>addLine(d.room_id,'['+l.stage+'] '+l.side+': '+l.message,sideCls(l.side)));});
-wsocket.on('admin_message',d=>addLine(d.room_id,'['+d.stage+'] '+d.side+': '+d.message,sideCls(d.side)));
+  d.logs.forEach(l=>addLine(d.room_id,'['+l.stage+'] '+l.side+' '+(l.username||'')+': '+l.message,sideCls(l.side)));});
+wsocket.on('admin_message',d=>addLine(d.room_id,'['+d.stage+'] '+d.side+' '+(d.username||'')+': '+d.message,sideCls(d.side)));
 wsocket.on('admin_summary',d=>addLine(d.room_id,'🤖 요약: '+d.summary,'sum'));
 wsocket.on('admin_stage',d=>addLine(d.room_id,'▶ '+d.stage,'sys'));
 wsocket.on('admin_end',d=>{addLine(d.room_id,'🔔 토론 종료\n'+d.result,'endmsg');refreshOps();});
@@ -1920,7 +1898,7 @@ def room_view(rid, r):
         'seconds_left': seconds_left(r),
         'paused': bool(r.get('paused_at')),
         'players': [{
-            'username': p['username'], 'alias': p['alias'], 'side': p['side'],
+            'username': p['username'], 'side': p['side'],
             'connected': p.get('connected', True),
             'absent_sec': (int(now - p['disconnect_at'])
                            if not p.get('connected', True) and p.get('disconnect_at') else 0),
@@ -2285,7 +2263,9 @@ def handle_admin_watch(data):
         emit('error_msg', {'msg': '존재하지 않거나 이미 종료된 토론입니다.'})
         return
     join_room(f"watch_{room_id}")
-    history_logs = [{'stage': l['stage'], 'side': l['side'], 'message': l['text']} for l in room['logs']]
+    by = {p['side']: p['username'] for p in room['players']}
+    history_logs = [{'stage': l['stage'], 'side': l['side'], 'username': by.get(l['side'], ''),
+                     'message': l['text']} for l in room['logs']]
     emit('admin_history', {'room_id': room_id, 'topic': room['topic'], 'logs': history_logs})
 
 
@@ -2320,7 +2300,8 @@ def close_room(room_id):
 
 def make_reveal_text(room):
     a, b = room['players'][0], room['players'][1]
-    return f"🎭 정체 공개!\n{a['alias']} ({a['side']}) = {a['username']}\n{b['alias']} ({b['side']}) = {b['username']}"
+    by = {p['side']: p['username'] for p in room['players']}
+    return f"🎭 정체 공개!\n찬성 = {by.get('찬성','?')}\n반대 = {by.get('반대','?')}"
 
 
 def who(player):
@@ -2419,7 +2400,6 @@ def _seat_in_room(username, sid):
     stage_idx = min(room['turn_count'], TOTAL_STAGES - 1)
     socketio.emit('resumed', {
         'room_id': room_id, 'topic': room['topic'],
-        'my_alias': me['alias'], 'opp_alias': opp['alias'],
         'my_side': me['side'], 'opp_side': opp['side'],
         'stage': STAGES[stage_idx], 'stage_index': stage_idx, 'total_stages': TOTAL_STAGES,
         'opening': opening,
@@ -2429,12 +2409,10 @@ def _seat_in_room(username, sid):
         'judging': bool(room.get('judging')),
         'seconds_left': seconds_left(room),
         'opp_connected': opp.get('connected', True),
-        'speaker_alias': room['players'][room['current_speaker']]['alias'],
         'speaker_side': room['players'][room['current_speaker']]['side'],
         'criteria': [{'stage': s, 'desc': d} for s, d in JUDGE_CRITERIA],
         'min_length': MIN_MESSAGE_LENGTH,
-        'logs': [{'sender': (me['alias'] if l['side'] == me['side'] else opp['alias']),
-                  'side': l['side'], 'stage': l['stage'], 'message': l['text']} for l in room['logs']],
+        'logs': [{'side': l['side'], 'stage': l['stage'], 'message': l['text']} for l in room['logs']],
     }, room=sid)
     if opp.get('connected', True):
         socketio.emit('opponent_reconnected', {'seconds_left': seconds_left(room)}, room=opp['sid'])
@@ -2476,17 +2454,12 @@ def handle_resume(data):
 
 
 def notify_waiting_status():
-    """대기 중인 사람들에게 지금 어떤 방식으로 매칭되는지 알려준다."""
-    reserved = reserved_usernames()
-    auto = auto_match_on()
+    """
+    대기 중인 사람들에게 안내. 랜덤인지, 운영자가 지정·예약한 매칭인지
+    참가자가 알 수 없도록 모두 같은 문구를 보낸다.
+    """
     for p in waiting_pool:
-        if p['username'] in reserved:
-            msg = '운영자가 지정한 상대를 기다리는 중... 상대가 들어오면 바로 시작합니다.'
-        elif auto:
-            msg = f'대기열에서 상대방 매칭을 기다리는 중... (대기 {len(waiting_pool)}명)'
-        else:
-            msg = '대기실에 입장했습니다. 운영자가 대진을 배정하면 바로 시작합니다.'
-        socketio.emit('status', {'msg': msg}, room=p['sid'])
+        socketio.emit('status', {'msg': '상대방 매칭을 기다리는 중... 매칭되면 바로 시작합니다.'}, room=p['sid'])
 
 
 @socketio.on('join_queue')
@@ -2555,15 +2528,14 @@ def launch_debate(p1, p2, side_mode="random", topic=""):
 
 
 def start_debate(p1, p2, side_mode="random", topic=""):
-    title_a, title_b = random.sample(ALIAS_POOL, 2)
     if side_mode == "a_pro":
         side_a, side_b = "찬성", "반대"
     elif side_mode == "a_con":
         side_a, side_b = "반대", "찬성"
     else:
         side_a, side_b = random.sample(["찬성", "반대"], 2)
-    p1.update(alias=title_a, side=side_a, connected=True)
-    p2.update(alias=title_b, side=side_b, connected=True)
+    p1.update(side=side_a, connected=True)
+    p2.update(side=side_b, connected=True)
     players = [p1, p2]
     random.shuffle(players)            # 반론 이후 누가 먼저 말할지는 무작위
     room_id = f"room_{uuid.uuid4().hex[:8]}"
@@ -2585,7 +2557,6 @@ def start_debate(p1, p2, side_mode="random", topic=""):
               'min_length': MIN_MESSAGE_LENGTH}
     for me, opp in ((players[0], players[1]), (players[1], players[0])):
         socketio.emit('match_found', {**common,
-                                      'my_alias': me['alias'], 'opp_alias': opp['alias'],
                                       'my_side': me['side'], 'opp_side': opp['side']}, room=me['sid'])
 
 
@@ -2653,10 +2624,11 @@ def _post_speech(room_id, room, speaker, text):
     stage_name = STAGES[min(room['turn_count'], TOTAL_STAGES - 1)]
     msg_id = uuid.uuid4().hex[:12]
     room['logs'].append({"side": speaker['side'], "stage": stage_name, "text": text})
-    socketio.emit('receive_message', {'sender': speaker['alias'], 'side': speaker['side'],
+    socketio.emit('receive_message', {'side': speaker['side'],
                                       'message': text, 'msg_id': msg_id, 'stage': stage_name},
                   room=room_id)
     socketio.emit('admin_message', {'room_id': room_id, 'side': speaker['side'], 'msg_id': msg_id,
+                                    'username': speaker['username'],
                                     'message': text, 'stage': stage_name}, room=f"watch_{room_id}")
     if text != TIMEOUT_MESSAGE:
         socketio.start_background_task(summarize_in_background, room_id, msg_id, text)
@@ -2679,7 +2651,6 @@ def _advance(room_id, room):
             'your_turn': i == next_idx, 'stage': STAGES[room['turn_count']],
             'stage_index': room['turn_count'], 'stage_changed': room.get('_stage_changed', False),
             'seconds_left': seconds_left(room),
-            'speaker_alias': room['players'][next_idx]['alias'],
             'speaker_side': room['players'][next_idx]['side']}, room=p['sid'])
     if room.get('_stage_changed'):
         socketio.emit('admin_stage', {'room_id': room_id, 'stage': STAGES[room['turn_count']]},
