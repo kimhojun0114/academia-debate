@@ -163,7 +163,9 @@ def db_execute_returning(query, params=()):
 def init_db():
     db_execute('''CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY, pin_hash TEXT,
-        wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, points INTEGER DEFAULT 1000)''')
+        wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, points INTEGER DEFAULT 0)''')
+    # 점수 = AI 심사 점수(100점 만점)의 누적. 새 계정은 0점에서 시작
+    db_execute("ALTER TABLE users ALTER COLUMN points SET DEFAULT 0")
     db_execute('''CREATE TABLE IF NOT EXISTS debates (
         id SERIAL PRIMARY KEY, played_at TEXT, topic TEXT,
         player_a TEXT, player_b TEXT, side_a TEXT, side_b TEXT,
@@ -567,8 +569,9 @@ def add_points(username, n):
     db_execute("UPDATE users SET points = points + %s WHERE username = %s", (n, username))
 
 def record_win_loss(winner, loser):
-    db_execute("UPDATE users SET wins = wins + 1, points = points + 20 WHERE username = %s", (winner,))
-    db_execute("UPDATE users SET losses = losses + 1, points = points - 15 WHERE username = %s", (loser,))
+    """승패만 기록한다. 점수는 심사 점수로 따로 쌓는다 (add_points)."""
+    db_execute("UPDATE users SET wins = wins + 1 WHERE username = %s", (winner,))
+    db_execute("UPDATE users SET losses = losses + 1 WHERE username = %s", (loser,))
 
 def save_debate(topic, player_a, player_b, side_a, side_b, logs, winner, reason, pending=None):
     """토론 기록 저장. 새 기록의 id를 돌려준다 (판정 대기·재심사에서 다시 찾기 위해)."""
@@ -886,6 +889,7 @@ reason에는 승패를 가른 결정적 차이를 단계별 근거와 함께 5�
                     f"단계별(찬성:반대, 각 25점): {stage_line}\n"
                     f"근거: {data.get('reason','근거 없음')}")
             return {"ok": True, "winner": winner, "text": text,
+                    "pro_total": pro_total, "con_total": con_total,
                     "no_will_side": no_will, "no_will_reason": data.get("no_will_reason", "")}
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
@@ -992,7 +996,7 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
 <div id="profile-area" class="box hidden">
   <p>👤 <b id="my-name"></b>님, 환영합니다!</p>
   <p class="stats" id="my-stats"></p>
-  <p style="font-size:0.9em;color:#555;">✅ 끝까지 완주하면 승패와 관계없이 <b>+5점</b>!</p>
+  <p style="font-size:0.9em;color:#555;">📊 점수는 매 경기 AI 심사 점수(100점 만점)가 승패와 관계없이 누적됩니다.</p>
   <button onclick="joinQueue()" id="match-btn" style="padding:10px 20px;cursor:pointer;background:#2563eb;color:white;border:none;border-radius:6px;font-weight:bold;">토론 매칭 시작</button>
   <p id="queue-text" style="color:#2563eb;font-weight:bold;margin-top:10px;"></p>
   <p class="nav"><a href="/ranking">🏆 랭킹 보기</a> · <a href="/history">📚 토론 기록</a> · <a href="#" onclick="logout();return false;">로그아웃</a></p>
@@ -1294,7 +1298,7 @@ socket.on('judging',d=>{showJudging(d.msg);
   el.textContent='⚖️ '+d.msg;cb.appendChild(el);cb.scrollTop=cb.scrollHeight;});
 socket.on('opponent_left',d=>{stopTimer();clearDrafts();
   alert("🚪 몰수승!\\n\\n"+(d.headline||"")+"\\n\\n"+d.reveal);location.reload();});
-socket.on('debate_end',d=>{stopTimer();clearDrafts();alert("🔔 토론 완료! (+5점)\\n\\n[AI 판정]\\n"+d.result);location.reload();});
+socket.on('debate_end',d=>{stopTimer();clearDrafts();alert("🔔 토론 완료!\\n\\n[AI 판정]\\n"+d.result);location.reload();});
 </script>
 </body></html>"""
 
@@ -1480,6 +1484,11 @@ button:disabled{opacity:.5;cursor:not-allowed;}
     <h3>🗑️ 아이디 삭제</h3>
     <p class="hint">삭제하면 전적도 함께 사라지고 되돌릴 수 없습니다.</p>
     <div id="del-users"></div>
+  </div>
+  <div class="box">
+    <h3>🔄 점수·전적 초기화</h3>
+    <p class="hint">모든 아이디의 점수·승·패를 0으로 되돌립니다. 아이디와 토론 기록은 그대로 남습니다. 되돌릴 수 없습니다.</p>
+    <button class="red" onclick="resetScores()">전체 점수·전적 0으로 초기화</button>
   </div>
   <div class="box">
     <h3>🗑️ AI 키 삭제</h3>
@@ -1732,6 +1741,9 @@ async function refreshDanger(){let d;try{d=await api('danger/state');}catch(e){r
     "<p class='hint'>등록된 키가 없습니다.</p>";}
 async function delUser(n){if(!confirm("'"+n+"' 아이디를 삭제할까요? 되돌릴 수 없습니다."))return;
   try{await api('danger/delete_user',{username:n});}catch(e){}refreshDanger();}
+async function resetScores(){
+  if(!confirm('모든 아이디의 점수와 전적을 0으로 초기화할까요?\n되돌릴 수 없습니다.'))return;
+  try{await api('danger/reset_scores');}catch(e){}refreshDanger();}
 async function delProfile(n){if(!confirm("'"+n+"' 키를 삭제할까요?"))return;
   try{await api('danger/delete_profile',{name:n});}catch(e){}refreshDanger();}
 
@@ -1772,7 +1784,7 @@ th.num,td.num{text-align:right;}
 <div class="box">
 <h2>🏆 랭킹</h2>
 <p class="sub">참가자 {{ totals.players }}명 · 누적 토론 {{ totals.debates }}회<br>
-승리 +20점 · 패배 −15점 · 완주 +5점 (시작 점수 1000점)</p>
+점수 = 매 경기 AI 심사 점수(100점 만점)의 누적 · 항복으로 끝난 경기는 점수 없음</p>
 <table>
 <tr><th class="rank">순위</th><th>아이디</th><th class="hide-sm">전적</th>
 <th class="num hide-sm">승률</th><th class="num">점수</th></tr>
@@ -2140,6 +2152,7 @@ def ops_resolve(data):
         loser_side = "찬성" if action == "forfeit_pro" else "반대"
         winner_side = "반대" if loser_side == "찬성" else "찬성"
         record_win_loss(by_side[winner_side], by_side[loser_side])
+        add_points(by_side[winner_side], pend.get("scores", {}).get(winner_side, 0))   # 몰수된 쪽은 0점
         headline = (f"{by_side[loser_side]}({loser_side}) 토론 의지 없음 → "
                     f"{by_side[winner_side]}({winner_side}) 몰수승 (운영자 승인)")
         new_reason = (f"{headline}\nAI 지적: {pend.get('no_will_reason','')}\n\n"
@@ -2152,6 +2165,8 @@ def ops_resolve(data):
         if ai_winner in by_side:
             loser = sb if ai_winner == sa else sa
             record_win_loss(by_side[ai_winner], by_side[loser])
+        for side, user in by_side.items():
+            add_points(user, pend.get("scores", {}).get(side, 0))
         new_reason = f"{pend.get('text','')}\n(토론 의지 없음 지적은 운영자가 기각)\n\n{reveal}"
         db_execute("UPDATE debates SET winner = %s, reason = %s, pending_json = NULL WHERE id = %s",
                    (ai_winner or "무승부", new_reason, did))
@@ -2334,6 +2349,13 @@ def danger_delete_user(data):
         return jsonify({"error": "토론 중인 아이디는 삭제할 수 없습니다."}), 400
     db_execute("DELETE FROM users WHERE username = %s", (target,))
     return jsonify({"ok": True, "msg": f"'{target}' 삭제 완료"})
+
+
+@app.route('/admin/api/danger/reset_scores', methods=['POST'])
+@admin_api("danger")
+def danger_reset_scores(data):
+    db_execute("UPDATE users SET wins = 0, losses = 0, points = 0")
+    return jsonify({"ok": True, "msg": "모든 아이디의 점수와 전적을 0으로 초기화했습니다. (토론 기록은 남아 있음)"})
 
 
 @app.route('/admin/api/danger/delete_profile', methods=['POST'])
@@ -2678,8 +2700,9 @@ def settle_result(result, a, b, reveal):
     by_side = {a[1]: a[0], b[1]: b[0]}
     if not result["ok"]:
         return "심사실패", result["text"] + "\n\n" + reveal, {"type": "rejudge", "reveal": reveal}
+    scores = {"찬성": result.get("pro_total", 0), "반대": result.get("con_total", 0)}
     if result["no_will_side"] != "없음":
-        pending = {"type": "no_will", "winner": result["winner"], "text": result["text"],
+        pending = {"type": "no_will", "winner": result["winner"], "text": result["text"], "scores": scores,
                    "no_will_side": result["no_will_side"],
                    "no_will_reason": result["no_will_reason"], "reveal": reveal}
         text = ("⏳ AI가 '토론 의지 없음'을 지적해 운영자가 확인 중입니다.\n"
@@ -2691,6 +2714,8 @@ def settle_result(result, a, b, reveal):
     if winner in by_side:
         loser_side = b[1] if winner == a[1] else a[1]
         record_win_loss(by_side[winner], by_side[loser_side])
+    for side, user in by_side.items():
+        add_points(user, scores.get(side, 0))     # 승패와 상관없이 각자 받은 심사 점수를 누적
     return winner, result["text"] + "\n\n" + reveal, None
 
 
@@ -2702,8 +2727,6 @@ def judge_in_background(room_id):
     try:
         result = judge_debate(room['topic'], room['logs'])
         pa, pb = room['players'][0], room['players'][1]
-        add_points(pa['username'], 5)
-        add_points(pb['username'], 5)
         reveal = make_reveal_text(room)
         winner, final_text, pending = settle_result(result, (pa['username'], pa['side']),
                                                     (pb['username'], pb['side']), reveal)
