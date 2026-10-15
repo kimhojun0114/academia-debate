@@ -133,25 +133,58 @@ BACKUP_TOPICS = [
 # ─────────────────────────────────────────────
 # DB 기본 유틸
 # ─────────────────────────────────────────────
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode=os.environ.get("DB_SSLMODE", "require"))
+# ── DB 연결 풀 ─────────────────────────────────────────────
+# 예전에는 조회할 때마다 DB에 새로 접속(보안 연결 포함)해서 버튼 하나에 수백 ms씩 걸렸다.
+# 접속을 몇 개 열어두고 돌려쓰면 그 대기 시간이 사라진다.
+from psycopg2 import pool as _pg_pool
+_pool = None
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        _pool = _pg_pool.ThreadedConnectionPool(
+            1, 8, DATABASE_URL, sslmode=os.environ.get("DB_SSLMODE", "require"),
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+    return _pool
+
+
+def _run(work):
+    """풀에서 연결을 빌려 work(cursor)를 실행. 끊어진 연결이면 버리고 한 번 더 시도한다."""
+    for attempt in range(2):
+        p = _get_pool()
+        conn = p.getconn()
+        broken = False
+        try:
+            cur = conn.cursor()
+            result = work(cur)
+            conn.commit()
+            cur.close()
+            return result
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            broken = True
+            if attempt == 1:
+                raise
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                broken = True
+            raise
+        finally:
+            try:
+                p.putconn(conn, close=broken or conn.closed != 0)
+            except Exception:
+                pass
+
 
 def db_execute(query, params=()):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    conn.commit()
-    cursor.close()
-    conn.close()
+    _run(lambda c: c.execute(query, params))
 
 def db_fetchall(query, params=()):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return rows
+    def work(c):
+        c.execute(query, params)
+        return c.fetchall()
+    return _run(work)
 
 def db_fetchone(query, params=()):
     rows = db_fetchall(query, params)
@@ -159,14 +192,10 @@ def db_fetchone(query, params=()):
 
 def db_execute_returning(query, params=()):
     """INSERT ... RETURNING 처럼 값을 돌려받으면서 커밋도 해야 하는 경우."""
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    row = cursor.fetchone()
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return row
+    def work(c):
+        c.execute(query, params)
+        return c.fetchone()
+    return _run(work)
 
 
 def init_db():
@@ -197,13 +226,23 @@ def init_db():
 # ─────────────────────────────────────────────
 # 설정 / AI 프로필 (DB 기반)
 # ─────────────────────────────────────────────
+# 설정은 자주 읽으므로 메모리에 들고 있는다 (서버가 하나뿐이라 안전). 쓸 때는 DB와 함께 갱신.
+_settings_cache = None
+
+def _load_settings():
+    global _settings_cache
+    if _settings_cache is None:
+        _settings_cache = {k: v for k, v in db_fetchall("SELECT key, value FROM app_settings")}
+    return _settings_cache
+
 def get_setting(key, default=None):
-    row = db_fetchone("SELECT value FROM app_settings WHERE key = %s", (key,))
-    return row[0] if row else default
+    v = _load_settings().get(key)
+    return v if v is not None else default
 
 def set_setting(key, value):
     db_execute("INSERT INTO app_settings (key, value) VALUES (%s, %s) "
                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (key, value))
+    _load_settings()[key] = value
 
 def list_profiles():
     rows = db_fetchall("SELECT name, provider, model, api_key FROM ai_profiles "
@@ -1014,6 +1053,10 @@ button:disabled{background:#9ca3af;border-color:#9ca3af;cursor:not-allowed;}
 <div id="profile-area" class="box hidden">
   <p>👤 <b id="my-name"></b>님, 환영합니다!</p>
   <p class="stats" id="my-stats"></p>
+  <details id="last-result" class="hidden" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin:8px 0;">
+    <summary style="cursor:pointer;font-weight:bold;"></summary>
+    <div class="lr-body" style="white-space:pre-wrap;font-size:0.9em;color:#374151;margin-top:8px;user-select:text;-webkit-user-select:text;"></div>
+  </details>
   <p style="font-size:0.9em;color:#555;">📊 점수는 매 경기 AI 심사 점수(100점 만점)가 승패와 관계없이 누적됩니다.</p>
   <button onclick="joinQueue()" id="match-btn" style="padding:10px 20px;cursor:pointer;background:#2563eb;color:white;border:none;border-radius:6px;font-weight:bold;">토론 매칭 시작</button>
   <button onclick="cancelQueue()" id="cancel-btn" class="hidden" style="padding:10px 16px;cursor:pointer;background:#fff !important;color:#dc2626 !important;-webkit-text-fill-color:#dc2626;border:1px solid #fca5a5;border-radius:6px;font-weight:bold;">매칭 취소</button>
@@ -1147,6 +1190,11 @@ socket.on('login_ok',d=>{
   if(!currentRoom)document.getElementById('profile-area').classList.remove('hidden');
   document.getElementById('my-name').textContent=d.username;
   document.getElementById('my-stats').textContent="내 전적: "+d.wins+"승 "+d.losses+"패 | 점수: "+d.points+"점 | 현재 "+d.rank+"위";
+  const lr=document.getElementById('last-result');
+  if(d.last_result){const r=d.last_result;lr.classList.remove('hidden');
+    lr.querySelector('summary').textContent="📋 최근 경기: "+r.outcome+" ("+r.my_side+") · "+r.played_at;
+    lr.querySelector('.lr-body').textContent="📌 "+r.topic+"\n\n"+r.reason;}
+  else{lr.classList.add('hidden');}
   // 대기실에 있다가 연결이 잠깐 끊겼으면 다시 줄을 선다
   if(wantQueue&&!currentRoom)socket.emit('join_queue',{});});
 
@@ -1183,7 +1231,9 @@ socket.on('resumed',d=>{
   if(d.min_length)minLength=d.min_length;
   renderCriteria(d.criteria);
   const cb=document.getElementById('chat-box');cb.innerHTML='';
-  d.logs.forEach(l=>appendMessage(cb,l,false));
+  d.logs.forEach(l=>{appendMessage(cb,l,false);
+    if(l.summary){const sd=document.createElement('div');sd.className='summary-item '+sideClass(l.side);
+      sd.textContent='🤖 AI 요약: '+l.summary;cb.appendChild(sd);}});
   cb.scrollTop=cb.scrollHeight;
   showStage(d.stage,d.stage_index,d.total_stages,false);
   restoreDraft();
@@ -1522,6 +1572,12 @@ button:disabled{opacity:.5;cursor:not-allowed;}
     <div id="del-users"></div>
   </div>
   <div class="box">
+    <h3>📚 토론 기록 삭제 <span id="debate-count" class="hint"></span></h3>
+    <p class="hint">기록만 지워지고 승패·점수는 바뀌지 않습니다. 점수까지 되돌리려면 아래 초기화를 쓰세요.</p>
+    <div id="del-debates" style="max-height:360px;overflow-y:auto;"></div>
+    <button class="redline" onclick="delDebate(null,true)">기록 전체 삭제</button>
+  </div>
+  <div class="box">
     <h3>🔄 점수·전적 초기화</h3>
     <p class="hint">모든 아이디의 점수·승·패를 0으로 되돌립니다. 아이디와 토론 기록은 그대로 남습니다. 되돌릴 수 없습니다.</p>
     <button class="red" onclick="resetScores()">전체 점수·전적 0으로 초기화</button>
@@ -1669,16 +1725,19 @@ function renderPending(list){
         "<button class='red' onclick=\"resolve("+p.id+",'forfeit_pro')\">찬성 몰수패</button>"+
         "<button class='red' onclick=\"resolve("+p.id+",'forfeit_con')\">반대 몰수패</button>"+
         "<button class='sub' onclick=\"resolve("+p.id+",'dismiss')\">기각 → AI 판정대로</button>"+
-        "<details><summary class='hint'>토론 전문</summary><div id='plog-"+p.id+"' class='hint'>기록 페이지(/history)에서 볼 수 있습니다.</div></details></div>";}
+        "<button class='sub' onclick='hidePending("+p.id+")'>목록에서 숨기기</button></div>";}
     return "<div class='pend fail'>"+head+"<div class='why'>"+esc((p.reason||'').split('\n\n')[0])+"</div>"+
       (p.rejudging?"<span class='hint'>⏳ 다시 심사하는 중...</span>":
-      "<button onclick='rejudge("+p.id+")'>🔁 다시 심사</button>")+"</div>";
+      "<button onclick='rejudge("+p.id+")'>🔁 다시 심사</button>")+
+      " <button class='sub' onclick='hidePending("+p.id+")'>목록에서 숨기기</button></div>";
   }).join('');
 }
 async function resolve(id,action){
   const label={forfeit_pro:'찬성측 몰수패',forfeit_con:'반대측 몰수패',dismiss:'기각(AI 판정 적용)'}[action];
   if(!confirm(label+'(으)로 처리할까요?'))return;
   try{await api('ops/resolve',{id,action});}catch(e){}refreshOps();}
+async function hidePending(id){if(!confirm('이 건을 확인 목록에서 숨길까요?\n승패·점수는 바뀌지 않고, 토론 기록에는 남습니다.'))return;
+  try{await api('ops/hide',{id});}catch(e){}refreshOps();}
 async function rejudge(id){try{await api('ops/rejudge',{id});}catch(e){}refreshOps();}
 
 function renderRooms(list,alertSec){
@@ -1784,12 +1843,20 @@ async function refreshDanger(){let d;try{d=await api('danger/state');}catch(e){r
     "<tr><td><b>"+esc(u.username)+"</b> <span class='hint'>"+u.wins+"승 "+u.losses+"패 · "+u.points+"점</span></td>"+
     "<td style='text-align:right;'><button class='redline' onclick=\"delUser('"+esc(u.username)+"')\">삭제</button></td></tr>").join('')+"</table>":
     "<p class='hint'>아이디가 없습니다.</p>";
+  document.getElementById('debate-count').textContent='(최근 '+d.debates.length+'건)';
+  document.getElementById('del-debates').innerHTML=d.debates.length?"<table>"+d.debates.map(x=>
+    "<tr><td><b>"+esc(x.topic)+"</b><br><span class='hint'>"+esc(x.played_at)+" · "+esc(x.player_a)+" vs "+esc(x.player_b)+
+    " · "+esc(x.winner)+"</span></td><td style='text-align:right;'><button class='redline' onclick='delDebate("+x.id+")'>삭제</button></td></tr>").join('')+"</table>":
+    "<p class='hint'>토론 기록이 없습니다.</p>";
   document.getElementById('del-profiles').innerHTML=d.profiles.length?"<table>"+d.profiles.map(p=>
     "<tr><td><b>"+esc(p.name)+"</b> <span class='hint'>"+esc(p.model)+(p.name===d.active?' · 사용 중':'')+"</span></td>"+
     "<td style='text-align:right;'><button class='redline' onclick=\"delProfile('"+esc(p.name)+"')\">삭제</button></td></tr>").join('')+"</table>":
     "<p class='hint'>등록된 키가 없습니다.</p>";}
 async function delUser(n){if(!confirm("'"+n+"' 아이디를 삭제할까요? 되돌릴 수 없습니다."))return;
   try{await api('danger/delete_user',{username:n});}catch(e){}refreshDanger();}
+async function delDebate(id,all){
+  if(!confirm(all?'토론 기록을 전부 삭제할까요? 되돌릴 수 없습니다.':'이 토론 기록을 삭제할까요?'))return;
+  try{await api('danger/delete_debate',all?{all:true}:{id});}catch(e){}refreshDanger();}
 async function resetScores(){
   if(!confirm('모든 아이디의 점수와 전적을 0으로 초기화할까요?\n되돌릴 수 없습니다.'))return;
   try{await api('danger/reset_scores');}catch(e){}refreshDanger();}
@@ -1863,6 +1930,7 @@ HISTORY_TEMPLATE = """<!DOCTYPE html>
 .log-line{margin:6px 0;font-size:0.92em;padding:6px 10px;border-radius:6px;border-left:4px solid #d1d5db;}
 .log-line.pro{border-left-color:#16a34a;background:#f0fdf4;}
 .log-line.con{border-left-color:#dc2626;background:#fef2f2;}
+.log-line .sum{color:#6b7280;font-size:0.9em;}
 .winner-tag{display:inline-block;padding:2px 8px;border-radius:6px;font-weight:bold;font-size:0.9em;}
 .w-fail{background:#fef3c7;color:#92400e;}
 .w-stop{background:#f1f5f9;color:#475569;}</style></head><body>
@@ -1875,7 +1943,7 @@ HISTORY_TEMPLATE = """<!DOCTYPE html>
 {% else %}<b>{{ d.winner }}</b>{% endif %}</p>
 <div class="reason">{{ d.reason }}</div>
 <details><summary>토론 전문 보기</summary>
-{% for line in d.logs %}<p class="log-line {{ 'pro' if line.side == '찬성' else 'con' }}"><b>[{{ line.stage }}] {{ line.side }}:</b> {{ line.text }}</p>{% endfor %}
+{% for line in d.logs %}<p class="log-line {{ 'pro' if line.side == '찬성' else 'con' }}"><b>[{{ line.stage }}] {{ line.side }}:</b> {{ line.text }}{% if line.auto %} <span class="sum">⏰ 시간 종료 자동 제출</span>{% endif %}{% if line.summary %}<br><span class="sum">🤖 요약: {{ line.summary }}</span>{% endif %}</p>{% endfor %}
 </details></div>{% else %}<p>아직 토론 기록이 없습니다.</p>{% endfor %}
 <p><a href="/">← 토론 화면</a> · <a href="/ranking">🏆 랭킹</a></p></body></html>"""
 
@@ -2070,6 +2138,8 @@ def pending_debates():
             pend = json.loads(r[9]) if r[9] else {}
         except Exception:
             pend = {}
+        if pend.get("hidden"):
+            continue
         out.append({"id": r[0], "played_at": r[1], "topic": r[2],
                     "player_a": r[3], "player_b": r[4], "side_a": r[5], "side_b": r[6],
                     "winner": r[7], "reason": r[8], "pending": pend,
@@ -2230,6 +2300,23 @@ def ops_resolve(data):
 _rejudging = set()
 
 
+@app.route('/admin/api/ops/hide', methods=['POST'])
+@admin_api("ops")
+def ops_hide(data):
+    """심사실패·판정대기 건을 확인 목록에서 숨긴다 (기록은 그대로, 전적·점수 변화 없음)."""
+    did = data.get("id")
+    row = db_fetchone("SELECT pending_json FROM debates WHERE id = %s", (did,))
+    if not row:
+        return jsonify({"error": "없는 기록입니다."}), 400
+    try:
+        pend = json.loads(row[0] or "{}")
+    except Exception:
+        pend = {}
+    pend["hidden"] = True
+    db_execute("UPDATE debates SET pending_json = %s WHERE id = %s", (json.dumps(pend, ensure_ascii=False), did))
+    return jsonify({"ok": True, "msg": "확인 목록에서 숨겼습니다. (토론 기록에는 남아 있음)"})
+
+
 @app.route('/admin/api/ops/rejudge', methods=['POST'])
 @admin_api("ops")
 def ops_rejudge(data):
@@ -2387,9 +2474,26 @@ def users_pin(data):
 @app.route('/admin/api/danger/state', methods=['POST'])
 @admin_api("danger")
 def danger_state(data):
+    debates = db_fetchall("SELECT id, played_at, topic, player_a, player_b, winner FROM debates "
+                          "ORDER BY id DESC LIMIT 100")
     return jsonify({"users": users_list(),
                     "profiles": [{"name": p["name"], "model": p["model"]} for p in list_profiles()],
-                    "active": get_active_name()})
+                    "active": get_active_name(),
+                    "debates": [{"id": r[0], "played_at": r[1], "topic": r[2], "player_a": r[3],
+                                 "player_b": r[4], "winner": r[5]} for r in debates]})
+
+
+@app.route('/admin/api/danger/delete_debate', methods=['POST'])
+@admin_api("danger")
+def danger_delete_debate(data):
+    if data.get("all"):
+        db_execute("DELETE FROM debates")
+        return jsonify({"ok": True, "msg": "토론 기록을 모두 삭제했습니다. (전적·점수는 그대로)"})
+    did = data.get("id")
+    if not db_fetchone("SELECT id FROM debates WHERE id = %s", (did,)):
+        return jsonify({"error": "없는 기록입니다."}), 400
+    db_execute("DELETE FROM debates WHERE id = %s", (did,))
+    return jsonify({"ok": True, "msg": "토론 기록 1건을 삭제했습니다. (전적·점수는 그대로)"})
 
 
 @app.route('/admin/api/danger/delete_user', methods=['POST'])
@@ -2542,11 +2646,34 @@ def _take_over_session(username, new_sid):
     sid_to_user[new_sid] = username
 
 
+def last_result(username):
+    """이 참가자의 가장 최근 경기 결과 (결과창을 놓쳤을 때 로비에서 다시 보도록)."""
+    row = db_fetchone("SELECT played_at, topic, player_a, side_a, side_b, winner, reason FROM debates "
+                      "WHERE player_a = %s OR player_b = %s ORDER BY id DESC LIMIT 1", (username, username))
+    if not row:
+        return None
+    played_at, topic, pa, sa, sb, winner, reason = row
+    my_side = sa if pa == username else sb
+    if winner in ("찬성", "반대"):
+        outcome = "승리" if winner == my_side else "패배"
+    elif winner == "몰수":
+        # 몰수 문구에서 승자 아이디를 찾는다: '... → 아이디(진영) 몰수승' / '아이디(진영) 항복으로 아이디(진영) 몰수승'
+        head = (reason or "").split("\n")[0]
+        winner_part = head.split("으로 ")[-1] if "항복으로" in head else head.split("→")[-1]
+        outcome = "몰수승" if winner_part.strip().startswith(f"{username}(") else "몰수패"
+    else:
+        outcome = {"무승부": "무승부", "중단": "중단 (승패 없음)", "판정대기": "운영자 확인 중",
+                   "심사실패": "심사 대기 중"}.get(winner, winner)
+    return {"played_at": played_at, "topic": topic, "my_side": my_side,
+            "outcome": outcome, "reason": reason or ""}
+
+
 def _profile_payload(username, token):
     stats = get_user_stats(username) or {"wins": 0, "losses": 0, "points": 0, "rank": "-"}
     return {'username': username, 'resume_token': token,
             'wins': stats['wins'], 'losses': stats['losses'],
-            'points': stats['points'], 'rank': stats['rank']}
+            'points': stats['points'], 'rank': stats['rank'],
+            'last_result': last_result(username)}
 
 
 def _seat_in_room(username, sid):
@@ -2585,7 +2712,8 @@ def _seat_in_room(username, sid):
         'speaker_side': room['players'][room['current_speaker']]['side'],
         'criteria': [{'stage': s, 'desc': d} for s, d in JUDGE_CRITERIA],
         'min_length': MIN_MESSAGE_LENGTH,
-        'logs': [{'side': l['side'], 'stage': l['stage'], 'message': l['text'], 'auto': l.get('auto', False)} for l in room['logs']],
+        'logs': [{'side': l['side'], 'stage': l['stage'], 'message': l['text'], 'auto': l.get('auto', False),
+                  'summary': l.get('summary')} for l in room['logs']],
     }, room=sid)
     if opp.get('connected', True):
         socketio.emit('opponent_reconnected', {'seconds_left': seconds_left(room)}, room=opp['sid'])
@@ -2733,9 +2861,11 @@ def start_debate(p1, p2, side_mode="random", topic=""):
                                       'my_side': me['side'], 'opp_side': opp['side']}, room=me['sid'])
 
 
-def summarize_in_background(room_id, msg_id, text):
-    """AI 요약을 따로 돌려 준비되는 대로 채워 넣는다."""
+def summarize_in_background(room_id, msg_id, text, log_entry=None):
+    """AI 요약을 따로 돌려 준비되는 대로 채워 넣는다. 토론 기록에도 함께 남긴다."""
     summary = get_ai_summary(text)
+    if summary and log_entry is not None:
+        log_entry['summary'] = summary
     socketio.emit('receive_summary', {'msg_id': msg_id, 'summary': summary}, room=room_id)
     if summary:
         socketio.emit('admin_summary', {'room_id': room_id, 'msg_id': msg_id, 'summary': summary},
@@ -2797,7 +2927,8 @@ def _post_speech(room_id, room, speaker, text, auto=False):
     """발언 하나를 기록하고 양쪽·관전자에게 보낸다. auto=시간 종료로 자동 제출된 것."""
     stage_name = STAGES[min(room['turn_count'], TOTAL_STAGES - 1)]
     msg_id = uuid.uuid4().hex[:12]
-    room['logs'].append({"side": speaker['side'], "stage": stage_name, "text": text, "auto": auto})
+    entry = {"side": speaker['side'], "stage": stage_name, "text": text, "auto": auto}
+    room['logs'].append(entry)
     socketio.emit('receive_message', {'side': speaker['side'], 'auto': auto,
                                       'message': text, 'msg_id': msg_id, 'stage': stage_name},
                   room=room_id)
@@ -2805,7 +2936,7 @@ def _post_speech(room_id, room, speaker, text, auto=False):
                                     'username': speaker['username'], 'auto': auto,
                                     'message': text, 'stage': stage_name}, room=f"watch_{room_id}")
     if text != EMPTY_MESSAGE:
-        socketio.start_background_task(summarize_in_background, room_id, msg_id, text)
+        socketio.start_background_task(summarize_in_background, room_id, msg_id, text, entry)
 
 
 def _advance(room_id, room):
